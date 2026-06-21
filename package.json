@@ -1,8 +1,12 @@
 {
   "name": "pi-tor-proxy",
-  "version": "0.2.0",
-  "description": "Self-contained Pi extension to route all requests through Tor",
+  "version": "0.1.0",
+  "description": "Self-contained Pi extension to route all requests through Tor - auto-downloads and manages Tor binary",
   "main": "index.ts",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/YuGiMob/pi-tor-proxy.git"
+  },
   "author": "pi-tor-proxy contributors",
   "keywords": [
     "pi-package",
@@ -11,7 +15,8 @@
     "extension",
     "tor",
     "privacy",
-    "proxy"
+    "proxy",
+    "anonymous"
   ],
   "license": "MIT",
   "files": [
@@ -28,6 +33,7 @@
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": ">=0.74.0"
   },
+  "scripts": {},
   "devDependencies": {
     "@earendil-works/pi-coding-agent": "^0.74.0",
     "@types/node": "^22.0.0"
