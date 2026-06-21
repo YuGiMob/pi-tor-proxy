@@ -1,6 +1,8 @@
 # pi-tor-proxy
 
-A [pi-coding-agent](https://github.com/badlogic/pi-mono/tree/main/packages/coding-agent) extension that routes all requests through the Tor network. **Self-contained** - automatically downloads and manages a Tor binary with no system installation required.
+A [pi-coding-agent](https://github.com/badlogic/pi-mono/tree/main/packages/coding-agent) extension that routes **pi agent requests** through the Tor network. **Self-contained** - automatically downloads and manages a Tor binary with no system installation required.
+
+> **Note:** This extension only routes requests made by the pi agent (HTTP calls, tool executions, etc.) through Tor. It does not affect other applications or system-wide traffic on your machine.
 
 When Tor mode is active:
 - **Environment variables** (`HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`) are set for HTTP/HTTPS requests
