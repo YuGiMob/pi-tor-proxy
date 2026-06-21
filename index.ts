@@ -522,3 +522,4 @@ export default function (pi: ExtensionAPI) {
     // Just clear the env vars for this pi process
     clearProxyEnv();
   });
+}
