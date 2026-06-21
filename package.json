@@ -1,6 +1,6 @@
 {
   "name": "pi-tor-proxy",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Self-contained Pi extension to route all requests through Tor - auto-downloads and manages Tor binary",
   "main": "index.ts",
   "repository": {
