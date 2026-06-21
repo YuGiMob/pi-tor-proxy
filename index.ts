@@ -264,6 +264,7 @@ export default function (pi: ExtensionAPI) {
           clearTimeout(timeout);
           state.torProcess = child;
           state.bootstrapped = true;
+          setupTorMonitor(torBin);
           resolve(true);
         }
       });
@@ -465,16 +466,49 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
+  // Monitor Tor process and auto-restart if it crashes
+  let restartAttempts = 0;
+  const MAX_RESTART_ATTEMPTS = 3;
+  
+  function setupTorMonitor(torBin: string) {
+    if (state.torProcess) {
+      state.torProcess.on("close", async (code) => {
+        if (state.enabled && code !== 0 && restartAttempts < MAX_RESTART_ATTEMPTS) {
+          restartAttempts++;
+          console.log(`Tor exited with code ${code}, restarting (attempt ${restartAttempts})...`);
+          state.torProcess = null;
+          state.bootstrapped = false;
+          await new Promise(r => setTimeout(r, 2000));
+          await startTor(torBin, () => {});
+        }
+      });
+    }
+  }
+
   // Restore state on session start
   pi.on("session_start", async (_event, ctx) => {
-    if (process.env["HTTP_PROXY"] === TOR_SOCKS_PROXY) {
-      const listening = await isTorListening();
-      if (listening) {
-        state.enabled = true;
-        const ip = await getTorIp();
-        state.currentIp = ip;
+    // Check if Tor is already listening (from a previous session)
+    const listening = await isTorListening();
+    
+    if (listening) {
+      // Tor is already running, just restore state
+      state.enabled = true;
+      setProxyEnv();
+      const ip = await getTorIp();
+      state.currentIp = ip;
+    } else if (state.enabled) {
+      // Tor was enabled but crashed, try to restart
+      const torBin = findTorBinary();
+      if (torBin) {
+        const started = await startTor(torBin, () => {});
+        if (started) {
+          setProxyEnv();
+          const ip = await getTorIp();
+          state.currentIp = ip;
+        }
       }
     }
+    
     updateStatus(ctx);
     if (state.enabled) {
       const ipMsg = state.currentIp ? ` (IP: ${state.currentIp})` : "";
@@ -482,9 +516,9 @@ export default function (pi: ExtensionAPI) {
     }
   });
 
-  // Cleanup
+  // On shutdown: keep Tor running, just clear env vars for this process
   pi.on("session_shutdown", async () => {
+    // Don't stop Tor - let it persist across sessions
+    // Just clear the env vars for this pi process
     clearProxyEnv();
-    stopTor();
   });
-}
