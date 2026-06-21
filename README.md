@@ -61,15 +61,6 @@ Use `/tor-cycle` to get a fresh Tor circuit with a new exit node. This restarts 
 | macOS | x86_64 (Intel) | ✅ Supported |
 | macOS | arm64 (Apple Silicon) | ✅ Supported |
 | Windows | any | ❌ Not supported |
-
-## Security Notes
-
-- Tor provides anonymity but not end-to-end encryption. Always use HTTPS for sensitive data.
-- DNS requests are routed through Tor via the `socks5h://` protocol.
-- Tor exit nodes can see unencrypted traffic. Use TLS/SSL for sensitive connections.
-- Some services block Tor exit nodes. You may encounter CAPTCHAs or access restrictions.
-- Tor is slower than direct connections due to multi-hop routing.
-
 ## Development
 
 ```bash
