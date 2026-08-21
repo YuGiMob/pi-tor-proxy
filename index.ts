@@ -12,8 +12,8 @@
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { spawn, type ChildProcess } from "node:child_process";
-import { existsSync, mkdirSync, chmodSync } from "node:fs";
+import { spawn, execFileSync, type ChildProcess } from "node:child_process";
+import { existsSync, mkdirSync, chmodSync, readFileSync, rmSync } from "node:fs";
 import net from "node:net";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -34,6 +34,7 @@ const STATUS_KEY = "tor";
 
 /** Directory to store Tor binary */
 const TOR_DIR = join(__dirname, ".tor");
+const TOR_DATA_DIR = join(TOR_DIR, "data");
 
 /** Environment variable names to set when Tor is active */
 const PROXY_ENV_VARS = [
@@ -48,7 +49,7 @@ const PROXY_ENV_VARS = [
 interface TorState {
   enabled: boolean;
   torProcess: ChildProcess | null;
-  bootstrapped: boolean;
+  torPid: number | null;
   currentIp: string | null;
 }
 
@@ -56,9 +57,12 @@ export default function (pi: ExtensionAPI) {
   const state: TorState = {
     enabled: false,
     torProcess: null,
-    bootstrapped: false,
+    torPid: null,
     currentIp: null,
   };
+
+  let restartAttempts = 0;
+  const MAX_RESTART_ATTEMPTS = 3;
 
   function setProxyEnv(): void {
     for (const v of PROXY_ENV_VARS) {
@@ -144,7 +148,7 @@ export default function (pi: ExtensionAPI) {
    * Download and extract Tor binary
    */
   async function downloadTor(
-    notify: (msg: string, level: string) => void
+    notify: (msg: string, level?: "info" | "warning" | "error") => void
   ): Promise<string | null> {
     const url = getTorDownloadUrl();
     if (!url) {
@@ -157,43 +161,40 @@ export default function (pi: ExtensionAPI) {
     try {
       mkdirSync(TOR_DIR, { recursive: true });
 
-      const response = await fetch(url);
+      const response = await fetch(url, { signal: AbortSignal.timeout(120_000) });
       if (!response.ok) {
         throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+      }
+      if (!response.body) {
+        throw new Error("Empty response body");
       }
 
       const tarPath = join(TOR_DIR, "tor.tar.gz");
       const fileStream = createWriteStream(tarPath);
 
-      if (response.body) {
-        await pipeline(Readable.fromWeb(response.body as any), fileStream);
-      }
+      await pipeline(Readable.fromWeb(response.body as any), fileStream);
 
       notify("Extracting Tor...", "info");
 
       await new Promise<void>((resolve, reject) => {
-        const child = spawn("tar", ["-xzf", tarPath, "-C", TOR_DIR]);
+        const child = spawn("tar", ["-xzf", tarPath, "-C", TOR_DIR], {
+          stdio: ["ignore", "ignore", "pipe"],
+        });
+        let stderr = "";
+        child.stderr?.on("data", (d: Buffer) => { stderr += d.toString(); });
         child.on("close", (code) => {
           if (code === 0) resolve();
-          else reject(new Error(`tar exited with code ${code}`));
+          else reject(new Error(`tar exited with code ${code}: ${stderr.trim()}`));
         });
         child.on("error", reject);
       });
 
-      const torBin = join(TOR_DIR, "tor", "tor");
-      if (existsSync(torBin)) {
+      const torBin = findTorBinary();
+      if (torBin) {
         chmodSync(torBin, 0o755);
-        spawn("rm", [tarPath]);
+        rmSync(tarPath);
         notify("Tor downloaded successfully!", "info");
         return torBin;
-      }
-
-      const debugBin = join(TOR_DIR, "debug", "tor");
-      if (existsSync(debugBin)) {
-        chmodSync(debugBin, 0o755);
-        spawn("rm", [tarPath]);
-        notify("Tor downloaded successfully!", "info");
-        return debugBin;
       }
 
       notify("Tor binary not found after extraction", "error");
@@ -220,23 +221,49 @@ export default function (pi: ExtensionAPI) {
     return null;
   }
 
+  function isTorProcess(pid: number): boolean {
+    if (process.platform === "linux") {
+      try {
+        return readFileSync(`/proc/${pid}/comm`, "utf8").trim().toLowerCase() === "tor";
+      } catch {
+        return false;
+      }
+    }
+    try {
+      const out = execFileSync("ps", ["-p", String(pid), "-o", "comm="], { encoding: "utf8" });
+      return out.trim().toLowerCase() === "tor";
+    } catch {
+      return false;
+    }
+  }
+
+  function readTorPid(): number | null {
+    try {
+      const pid = Number(readFileSync(join(TOR_DATA_DIR, "tor.pid"), "utf8").trim());
+      if (!Number.isInteger(pid) || pid <= 0) return null;
+      return isTorProcess(pid) ? pid : null;
+    } catch {
+      return null;
+    }
+  }
+
   /**
    * Start Tor process and wait for bootstrap
    */
   async function startTor(
     torBin: string,
-    notify: (msg: string, level: string) => void
+    notify: (msg: string, level?: "info" | "warning" | "error") => void
   ): Promise<boolean> {
     return new Promise((resolve) => {
       notify("Starting Tor...", "info");
 
-      const dataDir = join(TOR_DIR, "data");
-      mkdirSync(dataDir, { recursive: true });
+      mkdirSync(TOR_DATA_DIR, { recursive: true });
       const torDir = dirname(torBin);
 
       const child = spawn(torBin, [
         "--SocksPort", `${TOR_SOCKS_HOST}:${TOR_SOCKS_PORT}`,
-        "--DataDirectory", dataDir,
+        "--DataDirectory", TOR_DATA_DIR,
+        "--PidFile", join(TOR_DATA_DIR, "tor.pid"),
         "--Log", "notice stdout",
         "--DisableDebuggerAttachment", "0",
       ], {
@@ -263,7 +290,8 @@ export default function (pi: ExtensionAPI) {
           resolved = true;
           clearTimeout(timeout);
           state.torProcess = child;
-          state.bootstrapped = true;
+          state.torPid = child.pid ?? null;
+          restartAttempts = 0;
           setupTorMonitor(torBin);
           resolve(true);
         }
@@ -283,8 +311,8 @@ export default function (pi: ExtensionAPI) {
           notify(`Tor exited with code ${code}`, "error");
           resolve(false);
         }
-        state.torProcess = null;
-        state.bootstrapped = false;
+        if (state.torProcess === child) state.torProcess = null;
+        if (state.torPid === child.pid) state.torPid = null;
       });
 
       child.on("error", (err) => {
@@ -305,9 +333,11 @@ export default function (pi: ExtensionAPI) {
     if (state.torProcess) {
       state.torProcess.kill("SIGTERM");
       state.torProcess = null;
-      state.bootstrapped = false;
-      state.currentIp = null;
+    } else if (state.torPid) {
+      try { process.kill(state.torPid, "SIGTERM"); } catch {}
     }
+    state.torPid = null;
+    state.currentIp = null;
   }
 
   /**
@@ -331,20 +361,22 @@ export default function (pi: ExtensionAPI) {
    * Request new Tor circuit (new identity)
    */
   async function renewTorCircuit(): Promise<boolean> {
-    if (state.torProcess) {
-      const torBin = findTorBinary();
-      if (!torBin) return false;
+    const torBin = findTorBinary();
+    if (!torBin) return false;
 
+    if (state.torProcess) {
       state.torProcess.kill("SIGTERM");
       state.torProcess = null;
-      state.bootstrapped = false;
-
-      await new Promise(r => setTimeout(r, 1000));
-
-      return startTor(torBin, () => {});
+    } else if (state.torPid) {
+      try { process.kill(state.torPid, "SIGTERM"); } catch {}
+    } else {
+      return false;
     }
+    state.torPid = null;
 
-    return false;
+    await new Promise(r => setTimeout(r, 1000));
+
+    return startTor(torBin, () => {});
   }
 
   /**
@@ -353,7 +385,7 @@ export default function (pi: ExtensionAPI) {
   async function enableTor(ctx: {
     ui: {
       setStatus: (key: string, text: string) => void;
-      notify: (msg: string, level: string) => void;
+      notify: (msg: string, level?: "info" | "warning" | "error") => void;
     };
   }): Promise<void> {
     const listening = await isTorListening();
@@ -369,6 +401,8 @@ export default function (pi: ExtensionAPI) {
 
       const started = await startTor(torBin, ctx.ui.notify);
       if (!started) return;
+    } else {
+      state.torPid = readTorPid();
     }
 
     state.enabled = true;
@@ -388,7 +422,7 @@ export default function (pi: ExtensionAPI) {
   function disableTor(ctx: {
     ui: {
       setStatus: (key: string, text: string) => void;
-      notify: (msg: string, level: string) => void;
+      notify: (msg: string, level?: "info" | "warning" | "error") => void;
     };
   }): void {
     state.enabled = false;
@@ -467,9 +501,6 @@ export default function (pi: ExtensionAPI) {
   });
 
   // Monitor Tor process and auto-restart if it crashes
-  let restartAttempts = 0;
-  const MAX_RESTART_ATTEMPTS = 3;
-  
   function setupTorMonitor(torBin: string) {
     if (state.torProcess) {
       state.torProcess.on("close", async (code) => {
@@ -477,7 +508,6 @@ export default function (pi: ExtensionAPI) {
           restartAttempts++;
           console.log(`Tor exited with code ${code}, restarting (attempt ${restartAttempts})...`);
           state.torProcess = null;
-          state.bootstrapped = false;
           await new Promise(r => setTimeout(r, 2000));
           await startTor(torBin, () => {});
         }
@@ -494,6 +524,7 @@ export default function (pi: ExtensionAPI) {
       // Tor is already running, just restore state
       state.enabled = true;
       setProxyEnv();
+      state.torPid = readTorPid();
       const ip = await getTorIp();
       state.currentIp = ip;
     } else if (state.enabled) {
