@@ -76,12 +76,33 @@ export default function (pi: ExtensionAPI) {
     }
   }
 
-  function updateStatus(ctx: { ui: { setStatus: (key: string, text: string) => void } }): void {
+  function updateStatus(ui: { setStatus: (key: string, text: string) => void } | null): void {
+    if (!ui) return;
     if (state.enabled) {
       const ip = state.currentIp ? ` (${state.currentIp})` : "";
-      ctx.ui.setStatus(STATUS_KEY, `🔒 Tor${ip}`);
+      ui.setStatus(STATUS_KEY, `🔒 Tor${ip}`);
     } else {
-      ctx.ui.setStatus(STATUS_KEY, "");
+      ui.setStatus(STATUS_KEY, "");
+    }
+  }
+
+  let statusUi: { setStatus: (key: string, text: string) => void } | null = null;
+  let pollTimer: ReturnType<typeof setInterval> | null = null;
+
+  function startIpPolling(): void {
+    if (pollTimer) return;
+    pollTimer = setInterval(async () => {
+      const ip = await getTorIp();
+      if (!ip || ip === state.currentIp) return;
+      state.currentIp = ip;
+      updateStatus(statusUi);
+    }, 20_000);
+  }
+
+  function stopIpPolling(): void {
+    if (pollTimer) {
+      clearInterval(pollTimer);
+      pollTimer = null;
     }
   }
 
@@ -411,7 +432,9 @@ export default function (pi: ExtensionAPI) {
     const ip = await getTorIp();
     state.currentIp = ip;
 
-    updateStatus(ctx);
+    updateStatus(ctx.ui);
+    statusUi = ctx.ui;
+    startIpPolling();
     const ipMsg = ip ? `\nIP: ${ip}` : "";
     ctx.ui.notify(`Tor enabled${ipMsg}`, "info");
   }
@@ -429,7 +452,9 @@ export default function (pi: ExtensionAPI) {
     state.currentIp = null;
     clearProxyEnv();
     stopTor();
-    updateStatus(ctx);
+    stopIpPolling();
+    updateStatus(ctx.ui);
+    statusUi = null;
     ctx.ui.notify("Tor disabled.", "info");
   }
 
@@ -461,7 +486,7 @@ export default function (pi: ExtensionAPI) {
 
       const ipStr = ip ? `\nIP: ${ip}` : "\nIP: unknown";
       ctx.ui.notify(`Tor: ENABLED\nProxy: ${TOR_SOCKS_PROXY}${ipStr}`, "info");
-      updateStatus(ctx);
+      updateStatus(ctx.ui);
     },
   });
 
@@ -496,7 +521,7 @@ export default function (pi: ExtensionAPI) {
         ctx.ui.notify("Circuit cycled, but failed to get new IP", "info");
       }
 
-      updateStatus(ctx);
+      updateStatus(ctx.ui);
     },
   });
 
@@ -540,8 +565,10 @@ export default function (pi: ExtensionAPI) {
       }
     }
     
-    updateStatus(ctx);
+    updateStatus(ctx.ui);
+    statusUi = ctx.ui;
     if (state.enabled) {
+      startIpPolling();
       const ipMsg = state.currentIp ? ` (IP: ${state.currentIp})` : "";
       ctx.ui.notify(`Tor active${ipMsg}`, "info");
     }
@@ -552,5 +579,7 @@ export default function (pi: ExtensionAPI) {
     // Don't stop Tor - let it persist across sessions
     // Just clear the env vars for this pi process
     clearProxyEnv();
+    stopIpPolling();
+    statusUi = null;
   });
 }
