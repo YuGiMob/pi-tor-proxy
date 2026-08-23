@@ -214,7 +214,7 @@ export default function (pi: ExtensionAPI) {
       if (torBin) {
         chmodSync(torBin, 0o755);
         rmSync(tarPath);
-        notify("Tor downloaded successfully!", "info");
+        notify("Tor downloaded.", "info");
         return torBin;
       }
 
@@ -436,7 +436,7 @@ export default function (pi: ExtensionAPI) {
     statusUi = ctx.ui;
     startIpPolling();
     const ipMsg = ip ? `\nIP: ${ip}` : "";
-    ctx.ui.notify(`Tor enabled${ipMsg}`, "info");
+    ctx.ui.notify(`Tor enabled.${ipMsg}`, "info");
   }
 
   /**
