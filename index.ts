@@ -11,7 +11,7 @@
  *   /tor-cycle  - Get a new Tor circuit (new IP)
  */
 
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionCommandContext, ExtensionUIContext } from "@earendil-works/pi-coding-agent";
 import { spawn, execFileSync, type ChildProcess } from "node:child_process";
 import { existsSync, mkdirSync, chmodSync, readFileSync, rmSync } from "node:fs";
 import net from "node:net";
@@ -52,6 +52,7 @@ interface TorState {
   torPid: number | null;
   currentIp: string | null;
 }
+type Notify = ExtensionUIContext["notify"];
 
 export default function (pi: ExtensionAPI) {
   const state: TorState = {
@@ -62,6 +63,8 @@ export default function (pi: ExtensionAPI) {
   };
 
   let restartAttempts = 0;
+  let cycleInProgress = false;
+  let stopRequested = false;
   const MAX_RESTART_ATTEMPTS = 3;
 
   function setProxyEnv(): void {
@@ -76,7 +79,7 @@ export default function (pi: ExtensionAPI) {
     }
   }
 
-  function updateStatus(ui: { setStatus: (key: string, text: string) => void } | null): void {
+  function updateStatus(ui: ExtensionUIContext | null): void {
     if (!ui) return;
     if (state.enabled) {
       const ip = state.currentIp ? ` (${state.currentIp})` : "";
@@ -86,14 +89,21 @@ export default function (pi: ExtensionAPI) {
     }
   }
 
-  let statusUi: { setStatus: (key: string, text: string) => void } | null = null;
+  let statusUi: ExtensionUIContext | null = null;
   let pollTimer: ReturnType<typeof setInterval> | null = null;
 
   function startIpPolling(): void {
     if (pollTimer) return;
     pollTimer = setInterval(async () => {
       const ip = await getTorIp();
-      if (!ip || ip === state.currentIp) return;
+      if (!ip) {
+        if (state.currentIp) {
+          state.currentIp = null;
+          updateStatus(statusUi);
+        }
+        return;
+      }
+      if (ip === state.currentIp) return;
       state.currentIp = ip;
       updateStatus(statusUi);
     }, 20_000);
@@ -104,6 +114,10 @@ export default function (pi: ExtensionAPI) {
       clearInterval(pollTimer);
       pollTimer = null;
     }
+  }
+
+  function sleep(ms: number): Promise<void> {
+    return new Promise((resolve) => setTimeout(resolve, ms));
   }
 
   /**
@@ -169,7 +183,7 @@ export default function (pi: ExtensionAPI) {
    * Download and extract Tor binary
    */
   async function downloadTor(
-    notify: (msg: string, level?: "info" | "warning" | "error") => void
+    notify: Notify
   ): Promise<string | null> {
     const url = getTorDownloadUrl();
     if (!url) {
@@ -179,6 +193,7 @@ export default function (pi: ExtensionAPI) {
 
     notify("Downloading Tor... (first time only, ~30MB)", "info");
 
+    const tarPath = join(TOR_DIR, "tor.tar.gz");
     try {
       mkdirSync(TOR_DIR, { recursive: true });
 
@@ -190,7 +205,6 @@ export default function (pi: ExtensionAPI) {
         throw new Error("Empty response body");
       }
 
-      const tarPath = join(TOR_DIR, "tor.tar.gz");
       const fileStream = createWriteStream(tarPath);
 
       await pipeline(Readable.fromWeb(response.body as any), fileStream);
@@ -222,6 +236,7 @@ export default function (pi: ExtensionAPI) {
       return null;
     } catch (err) {
       notify(`Download failed: ${err instanceof Error ? err.message : String(err)}`, "error");
+      rmSync(tarPath, { force: true });
       return null;
     }
   }
@@ -273,7 +288,7 @@ export default function (pi: ExtensionAPI) {
    */
   async function startTor(
     torBin: string,
-    notify: (msg: string, level?: "info" | "warning" | "error") => void
+    notify: Notify = () => {}
   ): Promise<boolean> {
     return new Promise((resolve) => {
       notify("Starting Tor...", "info");
@@ -350,7 +365,7 @@ export default function (pi: ExtensionAPI) {
   /**
    * Stop Tor process
    */
-  function stopTor(): void {
+  function killTorProcess(): void {
     if (state.torProcess) {
       state.torProcess.kill("SIGTERM");
       state.torProcess = null;
@@ -358,6 +373,10 @@ export default function (pi: ExtensionAPI) {
       try { process.kill(state.torPid, "SIGTERM"); } catch {}
     }
     state.torPid = null;
+  }
+
+  function stopTor(): void {
+    killTorProcess();
     state.currentIp = null;
   }
 
@@ -384,31 +403,23 @@ export default function (pi: ExtensionAPI) {
   async function renewTorCircuit(): Promise<boolean> {
     const torBin = findTorBinary();
     if (!torBin) return false;
+    if (!state.torProcess && !state.torPid) return false;
 
-    if (state.torProcess) {
-      state.torProcess.kill("SIGTERM");
-      state.torProcess = null;
-    } else if (state.torPid) {
-      try { process.kill(state.torPid, "SIGTERM"); } catch {}
-    } else {
-      return false;
+    cycleInProgress = true;
+    try {
+      killTorProcess();
+      await sleep(1000);
+      return await startTor(torBin);
+    } finally {
+      cycleInProgress = false;
     }
-    state.torPid = null;
-
-    await new Promise(r => setTimeout(r, 1000));
-
-    return startTor(torBin, () => {});
   }
 
   /**
    * Enable Tor mode
    */
-  async function enableTor(ctx: {
-    ui: {
-      setStatus: (key: string, text: string) => void;
-      notify: (msg: string, level?: "info" | "warning" | "error") => void;
-    };
-  }): Promise<void> {
+  async function enableTor(ctx: ExtensionCommandContext): Promise<void> {
+    stopRequested = false;
     const listening = await isTorListening();
     if (!listening) {
       let torBin = findTorBinary();
@@ -422,6 +433,11 @@ export default function (pi: ExtensionAPI) {
 
       const started = await startTor(torBin, ctx.ui.notify);
       if (!started) return;
+      if (stopRequested) {
+        stopRequested = false;
+        disableTor(ctx);
+        return;
+      }
     } else {
       state.torPid = readTorPid();
     }
@@ -430,6 +446,11 @@ export default function (pi: ExtensionAPI) {
     setProxyEnv();
 
     const ip = await getTorIp();
+    if (stopRequested) {
+      stopRequested = false;
+      disableTor(ctx);
+      return;
+    }
     state.currentIp = ip;
 
     updateStatus(ctx.ui);
@@ -442,12 +463,7 @@ export default function (pi: ExtensionAPI) {
   /**
    * Disable Tor mode
    */
-  function disableTor(ctx: {
-    ui: {
-      setStatus: (key: string, text: string) => void;
-      notify: (msg: string, level?: "info" | "warning" | "error") => void;
-    };
-  }): void {
+  function disableTor(ctx: ExtensionCommandContext): void {
     state.enabled = false;
     state.currentIp = null;
     clearProxyEnv();
@@ -469,6 +485,7 @@ export default function (pi: ExtensionAPI) {
   pi.registerCommand("tor-stop", {
     description: "Disable Tor mode",
     handler: async (_args, ctx) => {
+      stopRequested = true;
       disableTor(ctx);
     },
   });
@@ -503,12 +520,20 @@ export default function (pi: ExtensionAPI) {
       const oldIp = state.currentIp;
       const success = await renewTorCircuit();
 
+      if (stopRequested) {
+        stopRequested = false;
+        stopTor();
+        return;
+      }
+
       if (!success) {
         ctx.ui.notify("Failed to cycle Tor circuit", "error");
         return;
       }
 
-      await new Promise(r => setTimeout(r, 3000));
+      await sleep(3000);
+
+      if (!state.enabled) return;
 
       const newIp = await getTorIp();
       state.currentIp = newIp;
@@ -529,12 +554,12 @@ export default function (pi: ExtensionAPI) {
   function setupTorMonitor(torBin: string) {
     if (state.torProcess) {
       state.torProcess.on("close", async (code) => {
-        if (state.enabled && code !== 0 && restartAttempts < MAX_RESTART_ATTEMPTS) {
+        if (state.enabled && !cycleInProgress && code !== 0 && restartAttempts < MAX_RESTART_ATTEMPTS) {
           restartAttempts++;
           console.log(`Tor exited with code ${code}, restarting (attempt ${restartAttempts})...`);
           state.torProcess = null;
-          await new Promise(r => setTimeout(r, 2000));
-          await startTor(torBin, () => {});
+          await sleep(2000);
+          await startTor(torBin);
         }
       });
     }
@@ -556,11 +581,16 @@ export default function (pi: ExtensionAPI) {
       // Tor was enabled but crashed, try to restart
       const torBin = findTorBinary();
       if (torBin) {
-        const started = await startTor(torBin, () => {});
+        const started = await startTor(torBin);
         if (started) {
-          setProxyEnv();
-          const ip = await getTorIp();
-          state.currentIp = ip;
+          if (stopRequested) {
+            stopRequested = false;
+            stopTor();
+          } else {
+            setProxyEnv();
+            const ip = await getTorIp();
+            state.currentIp = ip;
+          }
         }
       }
     }
