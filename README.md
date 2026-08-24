@@ -54,6 +54,10 @@ The `socks5h://` scheme means DNS requests are also routed through Tor.
 
 `/tor-cycle` restarts the Tor process to establish a fresh circuit with a new exit node.
 
+### Multiple pi instances
+
+Tor mode is shared across pi instances using the same extension installation: the desired state is stored in `.tor/data/enabled`, and each instance applies it to its own environment at turn boundaries. Stopping Tor in one instance lets the other instances finish their current turn through Tor before switching off; starting it takes effect from the next turn. The shared Tor process is only stopped once no instance is actively routing through it.
+
 ## Supported platforms
 
 | Platform | Architecture | Status |
