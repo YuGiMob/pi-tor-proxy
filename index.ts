@@ -13,11 +13,11 @@
 
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionUIContext } from "@earendil-works/pi-coding-agent";
 import { spawn, execFileSync, type ChildProcess } from "node:child_process";
-import { existsSync, mkdirSync, chmodSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { chmodSync, createReadStream, createWriteStream, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import net from "node:net";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
-import { createWriteStream } from "node:fs";
 import { pipeline } from "node:stream/promises";
 import { Readable } from "node:stream";
 
@@ -41,6 +41,16 @@ const LEASE_DIR = join(TOR_DIR, "leases");
 const LEASE_TTL_MS = 90_000;
 const STARTING_TTL_MS = 120_000;
 const HEARTBEAT_MS = 30_000;
+const MAX_CYCLE_ATTEMPTS = 3;
+const CYCLE_FIRST_WAIT_MS = 35_000;
+const CYCLE_RETRY_WAIT_MS = 20_000;
+const CYCLE_RETRY_DELAY_MS = 10_000;
+const TOR_BUNDLE_SHA256: Record<string, string> = {
+  "tor-expert-bundle-linux-x86_64-14.5.3.tar.gz": "34bac6a9cddfbd5cd8e74e546e00dcfa7aa988a19c3b5574ba7b52babe6c6e1a",
+  "tor-expert-bundle-macos-x86_64-14.5.3.tar.gz": "28f1a7355abd17d3ad0cc0438caf0a5c563939115e6e22885ea470a8bda55a27",
+  "tor-expert-bundle-macos-aarch64-14.5.3.tar.gz": "a57479977c07a270390b40bebff6a85f80de3007e0b637d63322e078f09c6ec9",
+  "tor-expert-bundle-linux-aarch64-16.0a7.tar.gz": "1a51b37cc68f2df4d8952d3f343794f2f966c59d84fe580c56192377c00fcc1b",
+};
 const TOR_CONTROL_HOST = "127.0.0.1";
 const TOR_CONTROL_PORT_FILE = join(TOR_DATA_DIR, "control.port");
 const TOR_CONTROL_COOKIE_FILE = join(TOR_DATA_DIR, "control_auth_cookie");
@@ -325,6 +335,12 @@ export default function (pi: ExtensionAPI) {
     return stableUrl;
   }
 
+  async function sha256File(path: string): Promise<string> {
+    const hash = createHash("sha256");
+    await pipeline(createReadStream(path), hash);
+    return hash.digest("hex");
+  }
+
   /**
    * Download and extract Tor binary
    */
@@ -354,6 +370,16 @@ export default function (pi: ExtensionAPI) {
       const fileStream = createWriteStream(tarPath);
 
       await pipeline(Readable.fromWeb(response.body as any), fileStream);
+
+      const fileName = url.split("/").pop() ?? "";
+      const expectedSha = TOR_BUNDLE_SHA256[fileName];
+      if (!expectedSha) {
+        throw new Error(`No pinned SHA-256 for ${fileName}`);
+      }
+      const actualSha = await sha256File(tarPath);
+      if (actualSha !== expectedSha) {
+        throw new Error(`Checksum mismatch for ${fileName}: expected ${expectedSha}, got ${actualSha}`);
+      }
 
       notify("Extracting Tor...", "info");
 
@@ -556,18 +582,42 @@ export default function (pi: ExtensionAPI) {
   /**
    * Get IP through Tor
    */
-  async function getTorIp(): Promise<string | null> {
+  function curlThroughTor(url: string): Promise<string | null> {
     return new Promise((resolve) => {
       const child = spawn("curl", [
         "-s", "--max-time", "15",
         "--proxy", TOR_SOCKS_PROXY,
-        "https://api.ipify.org",
+        url,
       ]);
       let output = "";
       child.stdout.on("data", (d: Buffer) => { output += d.toString(); });
       child.on("close", () => resolve(output.trim() || null));
       child.on("error", () => resolve(null));
     });
+  }
+
+  let leakReported = false;
+
+  async function getTorIp(): Promise<string | null> {
+    const check = await curlThroughTor("https://check.torproject.org/api/ip");
+    if (check) {
+      try {
+        const parsed = JSON.parse(check) as { IsTor?: unknown; IP?: unknown };
+        if (parsed.IsTor === true && typeof parsed.IP === "string" && parsed.IP) {
+          leakReported = false;
+          return parsed.IP;
+        }
+        if (parsed.IsTor === false) {
+          console.error("Traffic is not exiting through Tor: check.torproject.org reports IsTor=false");
+          if (!leakReported) {
+            leakReported = true;
+            statusUi?.notify("Traffic is not exiting through Tor — check your proxy configuration", "error");
+          }
+          return null;
+        }
+      } catch {}
+    }
+    return curlThroughTor("https://api.ipify.org");
   }
 
   /**
@@ -663,8 +713,8 @@ export default function (pi: ExtensionAPI) {
     });
   }
 
-  async function waitForNewIp(oldIp: string | null): Promise<string | null> {
-    const deadline = Date.now() + 35_000;
+  async function waitForNewIp(oldIp: string | null, timeoutMs: number): Promise<string | null> {
+    const deadline = Date.now() + timeoutMs;
     let lastIp: string | null = null;
     while (Date.now() < deadline) {
       if (!state.enabled) break;
@@ -819,12 +869,21 @@ export default function (pi: ExtensionAPI) {
       ctx.ui.notify("Cycling Tor circuit...", "info");
 
       const oldIp = state.currentIp;
-      const success = await renewTorCircuit();
+      let newIp: string | null = null;
+      let success = false;
 
-      if (stopRequested) {
-        stopRequested = false;
-        await stopTor();
-        return;
+      for (let attempt = 1; attempt <= MAX_CYCLE_ATTEMPTS; attempt++) {
+        success = await renewTorCircuit();
+        if (stopRequested) {
+          stopRequested = false;
+          await stopTor();
+          return;
+        }
+        if (!success) break;
+        newIp = await waitForNewIp(oldIp, attempt === 1 ? CYCLE_FIRST_WAIT_MS : CYCLE_RETRY_WAIT_MS);
+        if (!state.enabled) return;
+        if (newIp && newIp !== oldIp) break;
+        if (attempt < MAX_CYCLE_ATTEMPTS) await sleep(CYCLE_RETRY_DELAY_MS);
       }
 
       if (!success) {
@@ -832,8 +891,6 @@ export default function (pi: ExtensionAPI) {
         return;
       }
 
-      const newIp = await waitForNewIp(oldIp);
-      if (!state.enabled) return;
       state.currentIp = newIp;
 
       if (newIp && newIp !== oldIp) {

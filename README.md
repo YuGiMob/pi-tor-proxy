@@ -6,7 +6,7 @@ A [pi-coding-agent](https://github.com/badlogic/pi-mono/tree/main/packages/codin
 
 When Tor mode is active:
 - `HTTP_PROXY`, `HTTPS_PROXY`, and `ALL_PROXY` (plus lowercase variants) are set for HTTP/HTTPS requests
-- The footer shows your current exit IP: `🔒 Tor (IP: x.x.x.x)`
+- The footer shows your current exit IP: `🔒 Tor (IP: x.x.x.x)`, verified against `check.torproject.org` so a misconfigured proxy can't silently leak your real IP
 - The extension has no runtime dependencies: it uses only Node.js built-ins and downloads Tor from the Tor Project
 
 ## Installation
@@ -34,7 +34,7 @@ pi install /path/to/pi-tor-proxy
 
 ## How it works
 
-1. The first `/tor-start` downloads the Tor expert bundle (~30MB) from `archive.torproject.org`
+1. The first `/tor-start` downloads the Tor expert bundle (~30MB) from `archive.torproject.org` and verifies its SHA-256 checksum against a pinned digest
 2. The binary is stored in the extension's `.tor/` directory
 3. The extension starts Tor and waits for it to finish bootstrapping (typically 10-15 seconds)
 4. It sets proxy environment variables that most HTTP clients respect
@@ -52,7 +52,7 @@ The `socks5h://` scheme means DNS requests are also routed through Tor.
 
 ### Getting a new IP
 
-`/tor-cycle` signals the running Tor to build a fresh circuit over its control port (falling back to a restart if the control port is unavailable).
+`/tor-cycle` signals the running Tor to build a fresh circuit over its control port (falling back to a restart if the control port is unavailable). If the exit IP doesn't change, it automatically retries — Tor rate-limits NEWNYM to one effective signal every ~10 seconds.
 
 ### Multiple pi instances
 
