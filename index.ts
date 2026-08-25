@@ -36,8 +36,10 @@ const STATUS_KEY = "tor";
 const TOR_DIR = join(__dirname, ".tor");
 const TOR_DATA_DIR = join(TOR_DIR, "data");
 const TOR_STATE_FILE = join(TOR_DATA_DIR, "enabled");
+const TOR_STARTING_FILE = join(TOR_DATA_DIR, "starting");
 const LEASE_DIR = join(TOR_DIR, "leases");
 const LEASE_TTL_MS = 90_000;
+const STARTING_TTL_MS = 120_000;
 const HEARTBEAT_MS = 30_000;
 const TOR_CONTROL_HOST = "127.0.0.1";
 const TOR_CONTROL_PORT_FILE = join(TOR_DATA_DIR, "control.port");
@@ -75,8 +77,7 @@ export default function (pi: ExtensionAPI) {
   let cycleInProgress = false;
   let stopRequested = false;
   const MAX_RESTART_ATTEMPTS = 3;
-
-  let controlPort: number | null = null;
+  let startPromise: Promise<string | null> | null = null;
   function setProxyEnv(): void {
     for (const v of PROXY_ENV_VARS) {
       if (!savedProxyEnv.has(v)) savedProxyEnv.set(v, process.env[v]);
@@ -110,6 +111,33 @@ export default function (pi: ExtensionAPI) {
   function readPersistedEnabled(): boolean {
     try {
       return readFileSync(TOR_STATE_FILE, "utf8").trim() === "1";
+    } catch {
+      return false;
+    }
+  }
+
+  let startingMarkerWritten = false;
+
+  function writeStartingMarker(): void {
+    try {
+      mkdirSync(TOR_DATA_DIR, { recursive: true });
+      writeFileSync(TOR_STARTING_FILE, String(Date.now()));
+      startingMarkerWritten = true;
+    } catch {}
+  }
+
+  function clearStartingMarker(): void {
+    if (!startingMarkerWritten) return;
+    startingMarkerWritten = false;
+    try {
+      rmSync(TOR_STARTING_FILE, { force: true });
+    } catch {}
+  }
+
+  function startingInProgress(): boolean {
+    try {
+      const written = Number(readFileSync(TOR_STARTING_FILE, "utf8"));
+      return Number.isFinite(written) && Date.now() - written < STARTING_TTL_MS;
     } catch {
       return false;
     }
@@ -158,6 +186,7 @@ export default function (pi: ExtensionAPI) {
 
   async function maybeKillTor(): Promise<void> {
     if (readPersistedEnabled()) return;
+    if (startingInProgress()) return;
     if (!(await isTorListening())) return;
     if (anyLiveInstanceNeedsTor()) return;
     state.torPid = readTorPid();
@@ -170,7 +199,7 @@ export default function (pi: ExtensionAPI) {
     let listening = await isTorListening();
     if (enabled && !listening) {
       const torBin = findTorBinary();
-      if (torBin) listening = await startTor(torBin);
+      if (torBin) listening = (await startTor(torBin)) === null;
     }
     if (enabled && listening) {
       if (!envIsSet()) setProxyEnv();
@@ -193,50 +222,48 @@ export default function (pi: ExtensionAPI) {
   }
 
   let statusUi: ExtensionUIContext | null = null;
-  let pollTimer: ReturnType<typeof setInterval> | null = null;
-  let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
 
-  function startIpPolling(): void {
-    if (pollTimer) return;
-    pollTimer = setInterval(async () => {
-      const ip = await getTorIp();
-      if (!ip) {
-        if (state.currentIp) {
-          state.currentIp = null;
-          updateStatus(statusUi);
+  function createInterval(ms: number, fn: () => Promise<void>) {
+    let timer: ReturnType<typeof setInterval> | null = null;
+    return {
+      start() {
+        if (timer) return;
+        timer = setInterval(fn, ms);
+      },
+      stop() {
+        if (timer) {
+          clearInterval(timer);
+          timer = null;
         }
-        return;
+      },
+    };
+  }
+
+  const ipPolling = createInterval(20_000, async () => {
+    const ip = await getTorIp();
+    if (!ip) {
+      if (state.currentIp) {
+        state.currentIp = null;
+        updateStatus(statusUi);
       }
-      if (ip === state.currentIp) return;
-      state.currentIp = ip;
-      updateStatus(statusUi);
-    }, 20_000);
-  }
-
-  function stopIpPolling(): void {
-    if (pollTimer) {
-      clearInterval(pollTimer);
-      pollTimer = null;
+      return;
     }
-  }
+    if (ip === state.currentIp) return;
+    state.currentIp = ip;
+    updateStatus(statusUi);
+  });
 
-  function startHeartbeat(): void {
-    if (heartbeatTimer) return;
-    heartbeatTimer = setInterval(async () => {
-      writeLease();
-      if (!readPersistedEnabled()) await maybeKillTor();
-    }, HEARTBEAT_MS);
-  }
-
-  function stopHeartbeat(): void {
-    if (heartbeatTimer) {
-      clearInterval(heartbeatTimer);
-      heartbeatTimer = null;
-    }
-  }
+  const heartbeat = createInterval(HEARTBEAT_MS, async () => {
+    writeLease();
+    if (!readPersistedEnabled()) await maybeKillTor();
+  });
 
   function sleep(ms: number): Promise<void> {
     return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
+  function pendingNote(applyNow: boolean): string {
+    return applyNow ? "" : "\nApplies from next turn.";
   }
 
   /**
@@ -352,6 +379,7 @@ export default function (pi: ExtensionAPI) {
       }
 
       notify("Tor binary not found after extraction", "error");
+      rmSync(tarPath, { force: true });
       return null;
     } catch (err) {
       notify(`Download failed: ${err instanceof Error ? err.message : String(err)}`, "error");
@@ -405,12 +433,9 @@ export default function (pi: ExtensionAPI) {
   /**
    * Start Tor process and wait for bootstrap
    */
-  async function startTor(
-    torBin: string,
-    notify: Notify = () => {}
-  ): Promise<boolean> {
-    return new Promise((resolve) => {
-      notify("Starting Tor...", "info");
+  function startTor(torBin: string): Promise<string | null> {
+    if (startPromise) return startPromise;
+    const promise = new Promise<string | null>((resolve) => {
 
       mkdirSync(TOR_DATA_DIR, { recursive: true });
       const torDir = dirname(torBin);
@@ -428,37 +453,37 @@ export default function (pi: ExtensionAPI) {
         stdio: ["ignore", "pipe", "pipe"],
         env: {
           ...process.env,
-          LD_LIBRARY_PATH: torDir,
+          LD_LIBRARY_PATH: process.env.LD_LIBRARY_PATH
+            ? `${process.env.LD_LIBRARY_PATH}:${torDir}`
+            : torDir,
         },
       });
 
       let resolved = false;
+      let stdoutBuffer = "";
       const timeout = setTimeout(() => {
         if (!resolved) {
           resolved = true;
           child.kill();
-          notify("Tor startup timed out (60s)", "error");
-          resolve(false);
+          resolve("Tor startup timed out (60s)");
         }
       }, 60000);
 
       child.stdout?.on("data", (data: Buffer) => {
-        const text = data.toString();
-        const controlMatch = text.match(/Control listener listening on port (\d+)/);
-        if (controlMatch) {
-          controlPort = Number(controlMatch[1]);
-          try {
-            writeFileSync(TOR_CONTROL_PORT_FILE, String(controlPort));
-          } catch {}
-        }
-        if (text.includes("Bootstrapped 100%") && !resolved) {
-          resolved = true;
-          clearTimeout(timeout);
-          state.torProcess = child;
-          state.torPid = child.pid ?? null;
-          restartAttempts = 0;
-          setupTorMonitor(torBin);
-          resolve(true);
+        stdoutBuffer += data.toString();
+        let newlineIdx: number;
+        while ((newlineIdx = stdoutBuffer.indexOf("\n")) >= 0) {
+          const line = stdoutBuffer.slice(0, newlineIdx).trim();
+          stdoutBuffer = stdoutBuffer.slice(newlineIdx + 1);
+          if (line.includes("Bootstrapped 100%") && !resolved) {
+            resolved = true;
+            clearTimeout(timeout);
+            state.torProcess = child;
+            state.torPid = child.pid ?? null;
+            restartAttempts = 0;
+            setupTorMonitor(torBin);
+            resolve(null);
+          }
         }
       });
 
@@ -473,23 +498,24 @@ export default function (pi: ExtensionAPI) {
         if (!resolved) {
           resolved = true;
           clearTimeout(timeout);
-          notify(`Tor exited with code ${code}`, "error");
-          resolve(false);
+          resolve(`Tor exited with code ${code}`);
         }
         if (state.torProcess === child) state.torProcess = null;
         if (state.torPid === child.pid) state.torPid = null;
-        controlPort = null;
       });
 
       child.on("error", (err) => {
         if (!resolved) {
           resolved = true;
           clearTimeout(timeout);
-          notify(`Failed to start Tor: ${err.message}`, "error");
-          resolve(false);
+          resolve(`Failed to start Tor: ${err.message}`);
         }
       });
+    }).finally(() => {
+      startPromise = null;
     });
+    startPromise = promise;
+    return promise;
   }
 
   /**
@@ -500,7 +526,6 @@ export default function (pi: ExtensionAPI) {
     const pid = state.torPid;
     state.torProcess = null;
     state.torPid = null;
-    controlPort = null;
 
     if (child) {
       child.kill("SIGTERM");
@@ -569,7 +594,7 @@ export default function (pi: ExtensionAPI) {
   }
 
   async function signalNewnym(): Promise<"ok" | "rate-limited" | "failed"> {
-    const port = controlPort ?? readControlPort();
+    const port = readControlPort();
     if (!port) return "failed";
     const cookie = readControlCookie();
     if (!cookie) return "failed";
@@ -667,7 +692,7 @@ export default function (pi: ExtensionAPI) {
     try {
       await killTorProcess();
       await sleep(1000);
-      return await startTor(torBin);
+      return (await startTor(torBin)) === null;
     } finally {
       cycleInProgress = false;
     }
@@ -689,8 +714,14 @@ export default function (pi: ExtensionAPI) {
         return;
       }
 
-      const started = await startTor(torBin, ctx.ui.notify);
-      if (!started) return;
+      ctx.ui.notify("Starting Tor...", "info");
+      writeStartingMarker();
+      const failure = await startTor(torBin);
+      if (failure) {
+        clearStartingMarker();
+        ctx.ui.notify(failure, "error");
+        return;
+      }
       if (stopRequested) {
         stopRequested = false;
         await disableTor(ctx);
@@ -698,11 +729,11 @@ export default function (pi: ExtensionAPI) {
       }
     } else {
       state.torPid = readTorPid();
-      controlPort = readControlPort();
     }
 
     state.enabled = true;
     persistEnabled(true);
+    clearStartingMarker();
     if (ctx.isIdle() && !envIsSet()) setProxyEnv();
     writeLease();
 
@@ -716,9 +747,9 @@ export default function (pi: ExtensionAPI) {
 
     updateStatus(ctx.ui);
     statusUi = ctx.ui;
-    startIpPolling();
+    ipPolling.start();
     const ipMsg = ip ? `\nIP: ${ip}` : "";
-    const pending = ctx.isIdle() ? "" : "\nApplies from next turn.";
+    const pending = pendingNote(ctx.isIdle());
     ctx.ui.notify(`Tor enabled.${ipMsg}${pending}`, "info");
   }
 
@@ -726,16 +757,17 @@ export default function (pi: ExtensionAPI) {
    * Disable Tor mode
    */
   async function disableTor(ctx: ExtensionCommandContext): Promise<void> {
+    clearStartingMarker();
     state.enabled = false;
     state.currentIp = null;
     persistEnabled(false);
     if (ctx.isIdle() && envIsSet()) clearProxyEnv();
     writeLease();
     await maybeKillTor();
-    stopIpPolling();
+    ipPolling.stop();
     updateStatus(ctx.ui);
     statusUi = null;
-    const pending = ctx.isIdle() ? "" : "\nApplies from next turn.";
+    const pending = pendingNote(ctx.isIdle());
     ctx.ui.notify(`Tor disabled.${pending}`, "info");
   }
 
@@ -769,7 +801,7 @@ export default function (pi: ExtensionAPI) {
       const ip = await getTorIp();
       state.currentIp = ip;
 
-      const pending = ctx.isIdle() || envIsSet() ? "" : "\nApplies from next turn.";
+      const pending = pendingNote(ctx.isIdle() || envIsSet());
       const ipStr = ip ? `\nIP: ${ip}` : "\nIP: unknown";
       ctx.ui.notify(`Tor: ENABLED\nProxy: ${TOR_SOCKS_PROXY}${ipStr}${pending}`, "info");
       updateStatus(ctx.ui);
@@ -839,12 +871,11 @@ export default function (pi: ExtensionAPI) {
       let listening = await isTorListening();
       if (!listening) {
         const torBin = findTorBinary();
-        if (torBin) listening = await startTor(torBin);
+        if (torBin) listening = (await startTor(torBin)) === null;
       }
       if (listening) {
         if (!envIsSet()) setProxyEnv();
         state.torPid = readTorPid();
-        controlPort = readControlPort();
         const ip = await getTorIp();
         state.currentIp = ip;
         if (stopRequested) {
@@ -859,12 +890,12 @@ export default function (pi: ExtensionAPI) {
     }
     writeLease();
     await maybeKillTor();
-    startHeartbeat();
+    heartbeat.start();
 
     updateStatus(ctx.ui);
     statusUi = ctx.ui;
     if (state.enabled) {
-      startIpPolling();
+      ipPolling.start();
       const ipMsg = state.currentIp ? ` (IP: ${state.currentIp})` : "";
       ctx.ui.notify(`Tor active${ipMsg}`, "info");
     }
@@ -878,8 +909,8 @@ export default function (pi: ExtensionAPI) {
     if (envIsSet()) clearProxyEnv();
     writeLease();
     await maybeKillTor();
-    stopIpPolling();
-    stopHeartbeat();
+    ipPolling.stop();
+    heartbeat.stop();
     statusUi = null;
   });
 }
