@@ -13,7 +13,7 @@
 
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionUIContext } from "@earendil-works/pi-coding-agent";
 import { spawn, execFileSync, type ChildProcess } from "node:child_process";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { chmodSync, createReadStream, createWriteStream, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import net from "node:net";
 import { join, dirname } from "node:path";
@@ -27,7 +27,10 @@ const __dirname = dirname(__filename);
 /** Tor configuration */
 const TOR_SOCKS_HOST = "127.0.0.1";
 const TOR_SOCKS_PORT = 9050;
-const TOR_SOCKS_PROXY = `socks5h://${TOR_SOCKS_HOST}:${TOR_SOCKS_PORT}`;
+const TOR_SOCKS_AUTH_USER = `pi-${randomUUID().slice(0, 8)}`;
+const TOR_SOCKS_AUTH_PASS = "x";
+const TOR_SOCKS_PROXY = `socks5://${TOR_SOCKS_AUTH_USER}:${TOR_SOCKS_AUTH_PASS}@${TOR_SOCKS_HOST}:${TOR_SOCKS_PORT}`;
+const TOR_SOCKS_PROXY_DNS = `socks5h://${TOR_SOCKS_AUTH_USER}:${TOR_SOCKS_AUTH_PASS}@${TOR_SOCKS_HOST}:${TOR_SOCKS_PORT}`;
 
 /** Status key for footer display */
 const STATUS_KEY = "tor";
@@ -61,9 +64,9 @@ const PROXY_ENV_VARS = [
   "HTTPS_PROXY",
   "http_proxy",
   "https_proxy",
-  "ALL_PROXY",
-  "all_proxy",
 ] as const;
+const DNS_PROXY_ENV_VARS = ["ALL_PROXY", "all_proxy"] as const;
+const ALL_PROXY_ENV_VARS = [...PROXY_ENV_VARS, ...DNS_PROXY_ENV_VARS] as const;
 
 const savedProxyEnv = new Map<string, string | undefined>();
 
@@ -88,15 +91,18 @@ export default function (pi: ExtensionAPI) {
   let stopRequested = false;
   const MAX_RESTART_ATTEMPTS = 3;
   let startPromise: Promise<string | null> | null = null;
+  function setProxyVar(v: string, value: string): void {
+    if (!savedProxyEnv.has(v)) savedProxyEnv.set(v, process.env[v]);
+    process.env[v] = value;
+  }
+
   function setProxyEnv(): void {
-    for (const v of PROXY_ENV_VARS) {
-      if (!savedProxyEnv.has(v)) savedProxyEnv.set(v, process.env[v]);
-      process.env[v] = TOR_SOCKS_PROXY;
-    }
+    for (const v of PROXY_ENV_VARS) setProxyVar(v, TOR_SOCKS_PROXY);
+    for (const v of DNS_PROXY_ENV_VARS) setProxyVar(v, TOR_SOCKS_PROXY_DNS);
   }
 
   function clearProxyEnv(): void {
-    for (const v of PROXY_ENV_VARS) {
+    for (const v of ALL_PROXY_ENV_VARS) {
       if (!savedProxyEnv.has(v)) continue;
       const original = savedProxyEnv.get(v);
       if (original === undefined) {
@@ -225,7 +231,7 @@ export default function (pi: ExtensionAPI) {
     if (enabled && !listening) {
       const torBin = findTorBinary();
       if (torBin) {
-        startFailure = await startTor(torBin);
+        startFailure = await startOrAdopt(torBin);
         listening = startFailure === null;
       } else {
         startFailure = "Tor binary not found";
@@ -509,7 +515,7 @@ export default function (pi: ExtensionAPI) {
         "--DataDirectory", TOR_DATA_DIR,
         "--PidFile", join(TOR_DATA_DIR, "tor.pid"),
         "--Log", "notice stdout",
-        "--DisableDebuggerAttachment", "0",
+        "--DisableDebuggerAttachment", "1",
       ], {
         stdio: ["ignore", "pipe", "pipe"],
         env: {
@@ -586,6 +592,18 @@ export default function (pi: ExtensionAPI) {
     return promise;
   }
 
+  async function startOrAdopt(torBin: string): Promise<string | null> {
+    writeStartingMarker();
+    try {
+      const failure = await startTor(torBin);
+      if (!failure) return null;
+      const listening = await isTorListening();
+      return listening ? null : failure;
+    } finally {
+      clearStartingMarker();
+    }
+  }
+
   /**
    * Stop Tor process
    */
@@ -637,7 +655,7 @@ export default function (pi: ExtensionAPI) {
     return new Promise((resolve) => {
       const child = spawn("curl", [
         "-s", "--max-time", "15",
-        "--proxy", TOR_SOCKS_PROXY,
+        "--proxy", TOR_SOCKS_PROXY_DNS,
         url,
       ]);
       let output = "";
@@ -819,13 +837,12 @@ export default function (pi: ExtensionAPI) {
       }
 
       ctx.ui.notify("Starting Tor...", "info");
-      writeStartingMarker();
-      const failure = await startTor(torBin);
+      const failure = await startOrAdopt(torBin);
       if (failure) {
-        clearStartingMarker();
         ctx.ui.notify(failure, "error");
         return;
       }
+      if (!state.torProcess && !state.torPid) state.torPid = readTorPid();
       if (stopRequested) {
         stopRequested = false;
         await disableTor(ctx);
@@ -837,7 +854,6 @@ export default function (pi: ExtensionAPI) {
 
     state.enabled = true;
     persistEnabled(true);
-    clearStartingMarker();
     if (ctx.isIdle() && !envIsSet()) setProxyEnv();
     writeLease();
 
@@ -984,7 +1000,7 @@ export default function (pi: ExtensionAPI) {
       if (!listening) {
         const torBin = findTorBinary();
         if (torBin) {
-          startFailure = await startTor(torBin);
+          startFailure = await startOrAdopt(torBin);
           listening = startFailure === null;
         } else {
           startFailure = "Tor binary not found";

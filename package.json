@@ -33,9 +33,12 @@
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": ">=0.74.0"
   },
-  "scripts": {},
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
   "devDependencies": {
     "@earendil-works/pi-coding-agent": "^0.74.0",
-    "@types/node": "^22.0.0"
+    "@types/node": "^22.0.0",
+    "typescript": "^7.0.2"
   }
 }
