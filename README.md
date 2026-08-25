@@ -52,7 +52,7 @@ The `socks5h://` scheme means DNS requests are also routed through Tor.
 
 ### Getting a new IP
 
-`/tor-cycle` restarts the Tor process to establish a fresh circuit with a new exit node.
+`/tor-cycle` signals the running Tor to build a fresh circuit over its control port (falling back to a restart if the control port is unavailable).
 
 ### Multiple pi instances
 

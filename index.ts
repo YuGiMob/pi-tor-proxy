@@ -39,6 +39,9 @@ const TOR_STATE_FILE = join(TOR_DATA_DIR, "enabled");
 const LEASE_DIR = join(TOR_DIR, "leases");
 const LEASE_TTL_MS = 90_000;
 const HEARTBEAT_MS = 30_000;
+const TOR_CONTROL_HOST = "127.0.0.1";
+const TOR_CONTROL_PORT_FILE = join(TOR_DATA_DIR, "control.port");
+const TOR_CONTROL_COOKIE_FILE = join(TOR_DATA_DIR, "control_auth_cookie");
 
 /** Environment variable names to set when Tor is active */
 const PROXY_ENV_VARS = [
@@ -49,6 +52,8 @@ const PROXY_ENV_VARS = [
   "ALL_PROXY",
   "all_proxy",
 ] as const;
+
+const savedProxyEnv = new Map<string, string | undefined>();
 
 interface TorState {
   enabled: boolean;
@@ -71,15 +76,27 @@ export default function (pi: ExtensionAPI) {
   let stopRequested = false;
   const MAX_RESTART_ATTEMPTS = 3;
 
+  let controlPort: number | null = null;
   function setProxyEnv(): void {
     for (const v of PROXY_ENV_VARS) {
+      if (!savedProxyEnv.has(v)) savedProxyEnv.set(v, process.env[v]);
       process.env[v] = TOR_SOCKS_PROXY;
     }
   }
 
   function clearProxyEnv(): void {
     for (const v of PROXY_ENV_VARS) {
-      delete process.env[v];
+      if (savedProxyEnv.has(v)) {
+        const original = savedProxyEnv.get(v);
+        if (original === undefined) {
+          delete process.env[v];
+        } else {
+          process.env[v] = original;
+        }
+        savedProxyEnv.delete(v);
+      } else {
+        delete process.env[v];
+      }
     }
   }
 
@@ -400,6 +417,9 @@ export default function (pi: ExtensionAPI) {
 
       const child = spawn(torBin, [
         "--SocksPort", `${TOR_SOCKS_HOST}:${TOR_SOCKS_PORT}`,
+        "--ControlPort", "auto",
+        "--ControlPortWriteToFile", TOR_CONTROL_PORT_FILE,
+        "--CookieAuthentication", "1",
         "--DataDirectory", TOR_DATA_DIR,
         "--PidFile", join(TOR_DATA_DIR, "tor.pid"),
         "--Log", "notice stdout",
@@ -424,6 +444,13 @@ export default function (pi: ExtensionAPI) {
 
       child.stdout?.on("data", (data: Buffer) => {
         const text = data.toString();
+        const controlMatch = text.match(/Control listener listening on port (\d+)/);
+        if (controlMatch) {
+          controlPort = Number(controlMatch[1]);
+          try {
+            writeFileSync(TOR_CONTROL_PORT_FILE, String(controlPort));
+          } catch {}
+        }
         if (text.includes("Bootstrapped 100%") && !resolved) {
           resolved = true;
           clearTimeout(timeout);
@@ -451,6 +478,7 @@ export default function (pi: ExtensionAPI) {
         }
         if (state.torProcess === child) state.torProcess = null;
         if (state.torPid === child.pid) state.torPid = null;
+        controlPort = null;
       });
 
       child.on("error", (err) => {
@@ -472,6 +500,7 @@ export default function (pi: ExtensionAPI) {
     const pid = state.torPid;
     state.torProcess = null;
     state.torPid = null;
+    controlPort = null;
 
     if (child) {
       child.kill("SIGTERM");
@@ -519,7 +548,117 @@ export default function (pi: ExtensionAPI) {
   /**
    * Request new Tor circuit (new identity)
    */
+  function readControlPort(): number | null {
+    try {
+      const raw = readFileSync(TOR_CONTROL_PORT_FILE, "utf8").trim();
+      const match = raw.match(/PORT=(?:.*:)?(\d{1,5})$/);
+      const port = match ? Number(match[1]) : Number(raw);
+      return Number.isInteger(port) && port > 0 && port <= 65535 ? port : null;
+    } catch {
+      return null;
+    }
+  }
+
+  function readControlCookie(): Buffer | null {
+    try {
+      const cookie = readFileSync(TOR_CONTROL_COOKIE_FILE);
+      return cookie.length === 32 ? cookie : null;
+    } catch {
+      return null;
+    }
+  }
+
+  async function signalNewnym(): Promise<"ok" | "rate-limited" | "failed"> {
+    const port = controlPort ?? readControlPort();
+    if (!port) return "failed";
+    const cookie = readControlCookie();
+    if (!cookie) return "failed";
+
+    return new Promise((resolve) => {
+      const socket = new net.Socket();
+      let buffer = "";
+      let stage = 0;
+      let result: "ok" | "rate-limited" | "failed" = "failed";
+      let settled = false;
+
+      const settle = (value: "ok" | "rate-limited" | "failed") => {
+        if (settled) return;
+        settled = true;
+        socket.destroy();
+        resolve(value);
+      };
+
+      socket.setTimeout(8000);
+      socket.on("timeout", () => settle(result));
+      socket.on("error", () => settle(result));
+      socket.on("close", () => settle(result));
+
+      socket.on("connect", () => {
+        socket.write(`AUTHENTICATE ${cookie.toString("hex")}\r\nSIGNAL NEWNYM\r\nQUIT\r\n`);
+      });
+
+      socket.on("data", (chunk: Buffer) => {
+        buffer += chunk.toString();
+        let idx: number;
+        while ((idx = buffer.indexOf("\r\n")) >= 0) {
+          const line = buffer.slice(0, idx);
+          buffer = buffer.slice(idx + 2);
+          if (stage === 0) {
+            if (line.startsWith("250-")) continue;
+            if (line.startsWith("250 ")) {
+              stage = 1;
+              continue;
+            }
+            settle("failed");
+            return;
+          }
+          if (stage === 1) {
+            if (line.startsWith("250-")) continue;
+            if (line.startsWith("250")) {
+              result = "ok";
+              stage = 2;
+              continue;
+            }
+            if (line.startsWith("551")) {
+              result = "rate-limited";
+              stage = 2;
+              continue;
+            }
+            settle("failed");
+            return;
+          }
+          if (stage === 2) {
+            settle(result);
+            return;
+          }
+        }
+      });
+
+      socket.connect(port, TOR_CONTROL_HOST);
+    });
+  }
+
+  async function waitForNewIp(oldIp: string | null): Promise<string | null> {
+    const deadline = Date.now() + 35_000;
+    let lastIp: string | null = null;
+    while (Date.now() < deadline) {
+      if (!state.enabled) break;
+      const ip = await getTorIp();
+      if (ip) lastIp = ip;
+      if (ip && ip !== oldIp) return ip;
+      await sleep(2000);
+    }
+    return lastIp;
+  }
+
   async function renewTorCircuit(): Promise<boolean> {
+    const signal = await signalNewnym();
+    if (signal === "ok") return true;
+    if (signal === "rate-limited") {
+      await sleep(11_000);
+      if ((await signalNewnym()) === "ok") return true;
+    }
+
     const torBin = findTorBinary();
     if (!torBin) return false;
     if (!state.torProcess && !state.torPid) return false;
@@ -559,6 +698,7 @@ export default function (pi: ExtensionAPI) {
       }
     } else {
       state.torPid = readTorPid();
+      controlPort = readControlPort();
     }
 
     state.enabled = true;
@@ -660,11 +800,8 @@ export default function (pi: ExtensionAPI) {
         return;
       }
 
-      await sleep(3000);
-
+      const newIp = await waitForNewIp(oldIp);
       if (!state.enabled) return;
-
-      const newIp = await getTorIp();
       state.currentIp = newIp;
 
       if (newIp && newIp !== oldIp) {
@@ -707,6 +844,7 @@ export default function (pi: ExtensionAPI) {
       if (listening) {
         if (!envIsSet()) setProxyEnv();
         state.torPid = readTorPid();
+        controlPort = readControlPort();
         const ip = await getTorIp();
         state.currentIp = ip;
         if (stopRequested) {
