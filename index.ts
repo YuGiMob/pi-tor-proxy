@@ -171,6 +171,14 @@ export default function (pi: ExtensionAPI) {
     updatedAt: number;
   }
 
+  function readLeaseFile(name: string): InstanceLease | null {
+    try {
+      const lease = JSON.parse(readFileSync(join(LEASE_DIR, name), "utf8")) as InstanceLease;
+      if (lease && typeof lease.pid === "number" && typeof lease.envSet === "boolean" && typeof lease.updatedAt === "number") return lease;
+    } catch {}
+    return null;
+  }
+
   function writeLease(): void {
     try {
       mkdirSync(LEASE_DIR, { recursive: true });
@@ -178,8 +186,8 @@ export default function (pi: ExtensionAPI) {
       for (const file of readdirSync(LEASE_DIR)) {
         if (!file.endsWith(".json") || file === `${process.pid}.json`) continue;
         try {
-          const lease = JSON.parse(readFileSync(join(LEASE_DIR, file), "utf8")) as InstanceLease;
-          if (typeof lease?.updatedAt === "number" && now - lease.updatedAt >= LEASE_TTL_MS) {
+          const raw = JSON.parse(readFileSync(join(LEASE_DIR, file), "utf8")) as { updatedAt?: unknown };
+          if (typeof raw?.updatedAt === "number" && now - raw.updatedAt >= LEASE_TTL_MS) {
             rmSync(join(LEASE_DIR, file), { force: true });
           }
         } catch {}
@@ -196,12 +204,8 @@ export default function (pi: ExtensionAPI) {
     try {
       for (const file of readdirSync(LEASE_DIR)) {
         if (!file.endsWith(".json")) continue;
-        try {
-          const lease = JSON.parse(readFileSync(join(LEASE_DIR, file), "utf8")) as InstanceLease;
-          if (lease && typeof lease.pid === "number" && typeof lease.envSet === "boolean" && typeof lease.updatedAt === "number") {
-            leases.push(lease);
-          }
-        } catch {}
+        const lease = readLeaseFile(file);
+        if (lease) leases.push(lease);
       }
     } catch {}
     return leases;
@@ -215,9 +219,9 @@ export default function (pi: ExtensionAPI) {
   async function maybeKillTor(): Promise<void> {
     if (readPersistedEnabled()) return;
     if (startingInProgress()) return;
+    if (cycleInProgress) return;
     if (!(await isTorListening())) return;
     if (anyLiveInstanceNeedsTor()) return;
-    state.torPid = readTorPid();
     await killTorProcess();
   }
 
@@ -226,26 +230,16 @@ export default function (pi: ExtensionAPI) {
   async function syncEnvToMarker(): Promise<void> {
     const enabled = readPersistedEnabled();
     state.enabled = enabled;
-    let listening = await isTorListening();
-    let startFailure: string | null = null;
-    if (enabled && !listening) {
-      const torBin = findTorBinary();
-      if (torBin) {
-        startFailure = await startOrAdopt(torBin);
-        listening = startFailure === null;
-      } else {
-        startFailure = "Tor binary not found";
-      }
-    }
-    if (enabled && listening) {
+    const startFailure = enabled ? await ensureTorRunning() : null;
+    if (enabled && startFailure === null) {
       if (!envIsSet()) setProxyEnv();
       startFailureReported = false;
     } else if (!enabled && envIsSet()) {
       clearProxyEnv();
-    } else if (enabled && !startFailureReported) {
+    } else if (startFailure !== null && !startFailureReported) {
       state.enabled = false;
       startFailureReported = true;
-      statusUi?.notify(startFailure ?? "Tor is enabled but could not be started", "error");
+      statusUi?.notify(startFailure, "error");
     }
     writeLease();
     if (!enabled) await maybeKillTor();
@@ -291,6 +285,7 @@ export default function (pi: ExtensionAPI) {
   }
 
   const ipPolling = createInterval(20_000, async () => {
+    if (!state.enabled) return;
     const ip = await getTorIp();
     if (!ip) {
       if (state.currentIp) {
@@ -503,28 +498,33 @@ export default function (pi: ExtensionAPI) {
   function startTor(torBin: string): Promise<string | null> {
     if (startPromise) return startPromise;
     const promise = new Promise<string | null>((resolve) => {
+      let child: ChildProcess;
+      try {
+        mkdirSync(TOR_DATA_DIR, { recursive: true });
+        const torDir = dirname(torBin);
 
-      mkdirSync(TOR_DATA_DIR, { recursive: true });
-      const torDir = dirname(torBin);
-
-      const child = spawn(torBin, [
-        "--SocksPort", `${TOR_SOCKS_HOST}:${TOR_SOCKS_PORT}`,
-        "--ControlPort", "auto",
-        "--ControlPortWriteToFile", TOR_CONTROL_PORT_FILE,
-        "--CookieAuthentication", "1",
-        "--DataDirectory", TOR_DATA_DIR,
-        "--PidFile", join(TOR_DATA_DIR, "tor.pid"),
-        "--Log", "notice stdout",
-        "--DisableDebuggerAttachment", "1",
-      ], {
-        stdio: ["ignore", "pipe", "pipe"],
-        env: {
-          ...process.env,
-          LD_LIBRARY_PATH: process.env.LD_LIBRARY_PATH
-            ? `${process.env.LD_LIBRARY_PATH}:${torDir}`
-            : torDir,
-        },
-      });
+        child = spawn(torBin, [
+          "--SocksPort", `${TOR_SOCKS_HOST}:${TOR_SOCKS_PORT}`,
+          "--ControlPort", "auto",
+          "--ControlPortWriteToFile", TOR_CONTROL_PORT_FILE,
+          "--CookieAuthentication", "1",
+          "--DataDirectory", TOR_DATA_DIR,
+          "--PidFile", join(TOR_DATA_DIR, "tor.pid"),
+          "--Log", "notice stdout",
+          "--DisableDebuggerAttachment", "1",
+        ], {
+          stdio: ["ignore", "pipe", "pipe"],
+          env: {
+            ...process.env,
+            LD_LIBRARY_PATH: process.env.LD_LIBRARY_PATH
+              ? `${process.env.LD_LIBRARY_PATH}:${torDir}`
+              : torDir,
+          },
+        });
+      } catch (err) {
+        resolve(`Failed to start Tor: ${err instanceof Error ? err.message : String(err)}`);
+        return;
+      }
 
       let resolved = false;
       let stdoutBuffer = "";
@@ -552,6 +552,7 @@ export default function (pi: ExtensionAPI) {
           if (line.includes("Bootstrapped 100%") && !resolved) {
             resolved = true;
             clearTimeout(timeout);
+            stdoutBuffer = "";
             state.torProcess = child;
             state.torPid = child.pid ?? null;
             restartAttempts = 0;
@@ -604,12 +605,19 @@ export default function (pi: ExtensionAPI) {
     }
   }
 
+  async function ensureTorRunning(): Promise<string | null> {
+    if (await isTorListening()) return null;
+    const torBin = findTorBinary();
+    if (!torBin) return "Tor binary not found";
+    return startOrAdopt(torBin);
+  }
+
   /**
    * Stop Tor process
    */
   async function killTorProcess(): Promise<void> {
     const child = state.torProcess;
-    const pid = state.torPid;
+    const pid = state.torPid ?? readTorPid();
     state.torProcess = null;
     state.torPid = null;
 
@@ -995,18 +1003,8 @@ export default function (pi: ExtensionAPI) {
     state.enabled = shouldEnable;
 
     if (shouldEnable) {
-      let listening = await isTorListening();
-      let startFailure: string | null = null;
-      if (!listening) {
-        const torBin = findTorBinary();
-        if (torBin) {
-          startFailure = await startOrAdopt(torBin);
-          listening = startFailure === null;
-        } else {
-          startFailure = "Tor binary not found";
-        }
-      }
-      if (listening) {
+      const startFailure = await ensureTorRunning();
+      if (startFailure === null) {
         if (!envIsSet()) setProxyEnv();
         startFailureReported = false;
         state.torPid = readTorPid();
@@ -1021,7 +1019,7 @@ export default function (pi: ExtensionAPI) {
       } else {
         state.enabled = false;
         startFailureReported = true;
-        ctx.ui.notify(startFailure ?? "Tor is enabled but could not be started", "error");
+        ctx.ui.notify(startFailure, "error");
       }
     } else {
       if (envIsSet()) clearProxyEnv();
