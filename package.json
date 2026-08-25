@@ -1,6 +1,7 @@
 {
   "name": "pi-tor-proxy",
-  "version": "0.1.10",
+  "type": "module",
+  "version": "0.1.11",
   "description": "Pi extension that routes pi agent requests through Tor. It downloads and manages its own Tor binary, so nothing needs to be installed on the system.",
   "main": "index.ts",
   "repository": {
@@ -34,7 +35,8 @@
     "@earendil-works/pi-coding-agent": ">=0.74.0"
   },
   "scripts": {
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "smoke": "node scripts/smoke.mts"
   },
   "devDependencies": {
     "@earendil-works/pi-coding-agent": "^0.74.0",
