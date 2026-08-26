@@ -217,6 +217,17 @@ async function main(): Promise<void> {
       await withTimeout(Promise.resolve(command("tor-exclude").handler("off", ctx)), 180_000, "tor-exclude off");
       assert(unexpectedErrors().length === 0, `country clear errors: ${unexpectedErrors().map((n) => n.message).join(" | ")}`);
       console.log("Country config cleared.");
+
+      console.log("Checking stale cache recovery on pinned start...");
+      writeFileBestEffort(TOR_COUNTRY_FILE, JSON.stringify({ exitNodes: "de", excludeExitNodes: null }));
+      await withTimeout(Promise.resolve(command("tor-stop").handler("", ctx)), 60_000, "tor-stop before cache test");
+      writeFileSync(join(root, ".tor", "data", "cached-microdescs.new"), "partial");
+      await withTimeout(Promise.resolve(command("tor-start").handler("", ctx)), 120_000, "tor-start after cache poison");
+      assert(await isListening(SOCKS_PORT), "SOCKS port not listening after cache-recovery start");
+      writeFileBestEffort(TOR_COUNTRY_FILE, JSON.stringify({ exitNodes: null, excludeExitNodes: null }));
+      await withTimeout(Promise.resolve(command("tor-country").handler("off", ctx)), 180_000, "tor-country off after cache test");
+      assert(unexpectedErrors().length === 0, `cache-recovery errors: ${unexpectedErrors().map((n) => n.message).join(" | ")}`);
+      console.log("Stale cache recovery OK.");
     }
 
     console.log("Stopping Tor via /tor-stop...");

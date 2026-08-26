@@ -49,6 +49,8 @@ const CYCLE_FIRST_WAIT_MS = 35_000;
 const CYCLE_RETRY_WAIT_MS = 20_000;
 const CYCLE_RETRY_DELAY_MS = 10_000;
 const NEWNYM_RATE_LIMIT_MS = 11_000;
+const STARTUP_STALL_MS = 30_000;
+const STARTUP_TIMEOUT_MS = 60_000;
 const TOR_BUNDLE_SHA256: Record<string, string> = {
   "tor-expert-bundle-linux-x86_64-14.5.3.tar.gz": "34bac6a9cddfbd5cd8e74e546e00dcfa7aa988a19c3b5574ba7b52babe6c6e1a",
   "tor-expert-bundle-macos-x86_64-14.5.3.tar.gz": "28f1a7355abd17d3ad0cc0438caf0a5c563939115e6e22885ea470a8bda55a27",
@@ -64,6 +66,33 @@ const TOR_COUNTRY_FILE = join(TOR_DATA_DIR, "country");
 const TOR_COUNTRY_CODES = new Set(
   "ad ae af ag ai al am an ao ap aq ar as at au aw ax az ba bb bd be bf bg bh bi bj bl bm bn bo bq br bs bt bv bw by bz ca cc cd cf cg ch ci ck cl cm cn co cr cs cu cv cw cx cy cz de dj dk dm do dz ec ee eg eh er es et eu fi fj fk fm fo fr ga gb gd ge gf gg gh gi gl gm gn gp gq gr gs gt gu gw gy hk hn hr ht hu id ie il im in io iq ir is it je jm jo jp ke kg kh ki km kn kp kr kw ky kz la lb lc li lk lr ls lt lu lv ly ma mc md me mf mg mh mk ml mm mn mo mp mq mr ms mt mu mv mw mx my mz na nc ne nf ng ni nl no np nr nu nz om pa pe pf pg ph pk pl pm pn pr ps pt pw py qa re ro rs ru rw sa sb sc sd se sg sh si sj sk sl sm sn so sr ss st sv sx sy sz tc td tf tg th tj tk tl tm tn to tr tt tv tw tz ua ug uk um us uy uz va vc ve vg vi vn vu wf ws ye yt za zm zw".split(" ")
 );
+
+const countryNameOverrides: Record<string, string> = {
+  an: "Netherlands Antilles",
+  ap: "Asia-Pacific",
+  cs: "Serbia and Montenegro",
+};
+const regionDisplayNames = new Intl.DisplayNames(["en"], { type: "region" });
+function countryName(cc: string): string {
+  const overridden = countryNameOverrides[cc];
+  if (overridden) return overridden;
+  try {
+    return regionDisplayNames.of(cc.toUpperCase()) ?? cc;
+  } catch {
+    return cc;
+  }
+}
+function countryLabel(cc: string): string {
+  return `{${cc}} (${countryName(cc)})`;
+}
+function countryCompletions(prefix: string): { value: string; label: string }[] | null {
+  const query = prefix.trim().toLowerCase();
+  const items = [...TOR_COUNTRY_CODES]
+    .filter((cc) => cc.startsWith(query))
+    .map((cc) => ({ value: cc, label: `${cc} — ${countryName(cc)}` }));
+  if ("off".startsWith(query)) items.push({ value: "off", label: "off — clear the setting" });
+  return items.length > 0 ? items : null;
+}
 
 /** Environment variable names to set when Tor is active */
 const PROXY_ENV_VARS = [
@@ -551,6 +580,26 @@ export default function (pi: ExtensionAPI) {
   /**
    * Start Tor process and wait for bootstrap
    */
+  function removePartialDescriptorCache(): void {
+    try {
+      rmSync(join(TOR_DATA_DIR, "cached-microdescs.new"), { force: true });
+    } catch {}
+  }
+
+  function prepareTorStart(): void {
+    const country = readCountryConfig();
+    if (!country.exitNodes && !country.excludeExitNodes) return;
+    removePartialDescriptorCache();
+  }
+
+  function clearDescriptorCache(): void {
+    for (const name of ["cached-microdescs.new", "cached-microdescs", "cached-microdesc-consensus", "cached-certs"]) {
+      try {
+        rmSync(join(TOR_DATA_DIR, name), { force: true });
+      } catch {}
+    }
+  }
+
   function startTor(torBin: string): Promise<string | null> {
     if (startPromise) return startPromise;
     const promise = new Promise<string | null>((resolve) => {
@@ -558,6 +607,7 @@ export default function (pi: ExtensionAPI) {
       try {
         mkdirSync(TOR_DATA_DIR, { recursive: true });
         rotateTorLogIfLarge();
+        prepareTorStart();
         const torDir = dirname(torBin);
 
         child = spawn(torBin, [
@@ -589,20 +639,31 @@ export default function (pi: ExtensionAPI) {
 
       let resolved = false;
       let stdoutBuffer = "";
-      const timeout = setTimeout(() => {
-        if (!resolved) {
-          resolved = true;
-          child.kill("SIGTERM");
-          const deadline = Date.now() + 5000;
-          const poll = setInterval(() => {
-            if (child.exitCode !== null || Date.now() >= deadline) {
-              clearInterval(poll);
-              if (child.exitCode === null) child.kill("SIGKILL");
-              resolve("Tor startup timed out (60s)");
-            }
-          }, 250);
+      let sawProgress = false;
+      const startedAt = Date.now();
+      const terminateAndResolve = (message: string): void => {
+        if (resolved) return;
+        resolved = true;
+        clearInterval(watchdog);
+        child.kill("SIGTERM");
+        const deadline = Date.now() + 5000;
+        const poll = setInterval(() => {
+          if (child.exitCode !== null || Date.now() >= deadline) {
+            clearInterval(poll);
+            if (child.exitCode === null) child.kill("SIGKILL");
+            resolve(message);
+          }
+        }, 250);
+      };
+      const watchdog = setInterval(() => {
+        if (resolved) return;
+        const elapsed = Date.now() - startedAt;
+        if (elapsed >= STARTUP_TIMEOUT_MS) {
+          terminateAndResolve("Tor startup timed out (60s)");
+        } else if (!sawProgress && elapsed >= STARTUP_STALL_MS) {
+          terminateAndResolve("Tor startup stalled (no bootstrap progress)");
         }
-      }, 60000);
+      }, 1000);
 
       child.stdout?.on("data", (data: Buffer) => {
         stdoutBuffer += data.toString();
@@ -610,9 +671,10 @@ export default function (pi: ExtensionAPI) {
         while ((newlineIdx = stdoutBuffer.indexOf("\n")) >= 0) {
           const line = stdoutBuffer.slice(0, newlineIdx).trim();
           stdoutBuffer = stdoutBuffer.slice(newlineIdx + 1);
+          if (line.includes("Bootstrapped")) sawProgress = true;
           if (line.includes("Bootstrapped 100%") && !resolved) {
             resolved = true;
-            clearTimeout(timeout);
+            clearInterval(watchdog);
             stdoutBuffer = "";
             state.torProcess = child;
             state.torPid = child.pid ?? null;
@@ -633,7 +695,7 @@ export default function (pi: ExtensionAPI) {
       child.on("close", (code) => {
         if (!resolved) {
           resolved = true;
-          clearTimeout(timeout);
+          clearInterval(watchdog);
           resolve(`Tor exited with code ${code}`);
         }
         if (state.torProcess === child) state.torProcess = null;
@@ -643,7 +705,7 @@ export default function (pi: ExtensionAPI) {
       child.on("error", (err) => {
         if (!resolved) {
           resolved = true;
-          clearTimeout(timeout);
+          clearInterval(watchdog);
           resolve(`Failed to start Tor: ${err.message}`);
         }
       });
@@ -654,12 +716,20 @@ export default function (pi: ExtensionAPI) {
     return promise;
   }
 
-  async function startOrAdopt(torBin: string): Promise<string | null> {
-    writeStartingMarker();
+  async function startTorWithRetry(torBin: string): Promise<string | null> {
     const failure = await startTor(torBin);
     if (!failure) return null;
-    const listening = await isTorListening();
-    return listening ? null : failure;
+    if (await isTorListening()) return null;
+    statusUi?.notify("Tor startup failed; clearing stale cache and retrying...", "warning");
+    clearDescriptorCache();
+    const retry = await startTor(torBin);
+    if (!retry) return null;
+    return (await isTorListening()) ? null : retry;
+  }
+
+  async function startOrAdopt(torBin: string): Promise<string | null> {
+    writeStartingMarker();
+    return startTorWithRetry(torBin);
   }
 
   async function ensureTorRunning(): Promise<string | null> {
@@ -694,7 +764,7 @@ export default function (pi: ExtensionAPI) {
     for (let i = 0; i < 20; i++) {
       await sleep(250);
       const exited = child ? child.exitCode !== null : !(await isTorListening());
-      if (exited) return;
+      if (exited) break;
     }
 
     if (child) {
@@ -702,6 +772,7 @@ export default function (pi: ExtensionAPI) {
     } else if (pid) {
       try { process.kill(pid, "SIGKILL"); } catch {}
     }
+    removePartialDescriptorCache();
   }
 
   let curlMissingReported = false;
@@ -923,7 +994,7 @@ export default function (pi: ExtensionAPI) {
     try {
       await killTorProcess();
       await sleep(1000);
-      return (await startTor(torBin)) === null;
+      return (await startTorWithRetry(torBin)) === null;
     } finally {
       cycleInProgress = false;
     }
@@ -1094,6 +1165,7 @@ export default function (pi: ExtensionAPI) {
     const parsed = parseCountryArg(args);
     const config = readCountryConfig();
     const what = label === "exclude" ? "Excluded country" : "Exit country";
+    const setting = parsed.cc ? `set to ${countryLabel(parsed.cc)}` : "cleared";
 
     if (parsed.missing) {
       const current = config[field];
@@ -1109,16 +1181,16 @@ export default function (pi: ExtensionAPI) {
     writeCountryConfig(config);
 
     if (!state.enabled) {
-      ctx.ui.notify(`${what} ${parsed.clear ? "cleared" : `set to {${parsed.cc}}`}. Applies when Tor starts.`, "info");
+      ctx.ui.notify(`${what} ${setting}. Applies when Tor starts.`, "info");
       return;
     }
 
     if (!(await applyCountryConfig(config))) {
-      ctx.ui.notify(`${what} ${parsed.clear ? "cleared" : `set to {${parsed.cc}}`}, but the running Tor did not accept it.`, "error");
+      ctx.ui.notify(`${what} ${setting}, but the running Tor did not accept it.`, "error");
       return;
     }
 
-    ctx.ui.notify(`${what} ${parsed.clear ? "cleared" : `set to {${parsed.cc}}`}. Cycling circuit...`, "info");
+    ctx.ui.notify(`${what} ${setting}. Cycling circuit...`, "info");
     await cycleCircuit(ctx);
   }
 
@@ -1136,6 +1208,7 @@ export default function (pi: ExtensionAPI) {
 
   pi.registerCommand("tor-country", {
     description: "Pin Tor exit nodes to a country (2-letter ISO code, e.g. us). Use 'off' to clear.",
+    getArgumentCompletions: (prefix) => countryCompletions(prefix),
     handler: async (args, ctx) => {
       await setCountry(ctx, "exitNodes", "country", args);
     },
@@ -1143,6 +1216,7 @@ export default function (pi: ExtensionAPI) {
 
   pi.registerCommand("tor-exclude", {
     description: "Never use Tor exit nodes in a country (2-letter ISO code, e.g. ru). Use 'off' to clear.",
+    getArgumentCompletions: (prefix) => countryCompletions(prefix),
     handler: async (args, ctx) => {
       await setCountry(ctx, "excludeExitNodes", "exclude", args);
     },
@@ -1157,7 +1231,7 @@ export default function (pi: ExtensionAPI) {
           state.torProcess = null;
           await sleep(2000);
           if (!state.enabled || cycleInProgress) return;
-          await startTor(torBin);
+          await startTorWithRetry(torBin);
         }
       });
     }

@@ -38,7 +38,7 @@ pi install /path/to/pi-tor-proxy
 
 1. The first `/tor-start` downloads the Tor expert bundle (~30MB) from `archive.torproject.org` and verifies its SHA-256 checksum against a pinned digest
 2. The binary is stored in the extension's `.tor/` directory
-3. The extension starts Tor and waits for it to finish bootstrapping (typically 10-15 seconds)
+3. The extension starts Tor and waits for it to finish bootstrapping (typically 10-15 seconds). A start that shows no bootstrap progress for 30 seconds is treated as stalled, the stale descriptor cache left by an interrupted run is cleared, and startup is retried once automatically
 4. It sets proxy environment variables that most HTTP clients respect
 5. The footer shows `🔒 Tor (IP: x.x.x.x)` when active
 
