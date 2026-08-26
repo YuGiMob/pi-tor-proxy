@@ -1023,8 +1023,13 @@ export default function (pi: ExtensionAPI) {
       }
 
       ctx.ui.notify("Starting Tor...", "info");
+      const wasEnabled = readPersistedEnabled();
+      state.enabled = true;
+      persistEnabled(true);
       const failure = await startOrAdopt(torBin);
       if (failure) {
+        state.enabled = false;
+        if (!wasEnabled) persistEnabled(false);
         clearStartingMarker();
         ctx.ui.notify(failure, "error");
         return;
