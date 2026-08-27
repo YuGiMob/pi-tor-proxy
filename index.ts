@@ -1,16 +1,3 @@
-/**
- * pi-tor-proxy
- *
- * Self-contained Pi extension that routes all requests through Tor.
- * Automatically downloads and manages a Tor binary - no system install required.
- *
- * Commands:
- *   /tor-start  - Enable Tor mode (downloads on first run)
- *   /tor-stop   - Disable Tor mode
- *   /tor-status - Show current Tor status and IP
- *   /tor-cycle  - Get a new Tor circuit (new IP)
- */
-
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext, ExtensionUIContext } from "@earendil-works/pi-coding-agent";
 import { spawn, execFileSync, type ChildProcess } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
@@ -24,7 +11,6 @@ import { Readable } from "node:stream";
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
-/** Tor configuration */
 const TOR_SOCKS_HOST = "127.0.0.1";
 const TOR_SOCKS_PORT = 9050;
 const TOR_SOCKS_AUTH_USER = `pi-${randomUUID().slice(0, 8)}`;
@@ -32,10 +18,8 @@ const TOR_SOCKS_AUTH_PASS = "x";
 const TOR_SOCKS_PROXY = `socks5://${TOR_SOCKS_AUTH_USER}:${TOR_SOCKS_AUTH_PASS}@${TOR_SOCKS_HOST}:${TOR_SOCKS_PORT}`;
 const TOR_SOCKS_PROXY_DNS = `socks5h://${TOR_SOCKS_AUTH_USER}:${TOR_SOCKS_AUTH_PASS}@${TOR_SOCKS_HOST}:${TOR_SOCKS_PORT}`;
 
-/** Status key for footer display */
 const STATUS_KEY = "tor";
 
-/** Directory to store Tor binary */
 const TOR_DIR = join(__dirname, ".tor");
 const TOR_DATA_DIR = join(TOR_DIR, "data");
 const TOR_STATE_FILE = join(TOR_DATA_DIR, "enabled");
@@ -94,7 +78,6 @@ function countryCompletions(prefix: string): { value: string; label: string }[] 
   return items.length > 0 ? items : null;
 }
 
-/** Environment variable names to set when Tor is active */
 const PROXY_ENV_VARS = [
   "HTTP_PROXY",
   "HTTPS_PROXY",
@@ -397,11 +380,8 @@ export default function (pi: ExtensionAPI) {
     return applyNow ? "" : "\nApplies from next turn.";
   }
 
-  /**
-   * Check if Tor is listening on SOCKS port
-   */
-  async function isTorListening(): Promise<boolean> {
-    return new Promise((resolve) => {
+  async function probeTorOnce(): Promise<boolean> {
+    return new Promise<boolean>((resolve) => {
       const socket = new net.Socket();
       socket.setTimeout(1500);
       socket.on("connect", () => { socket.destroy(); resolve(true); });
@@ -410,17 +390,28 @@ export default function (pi: ExtensionAPI) {
       socket.connect(TOR_SOCKS_PORT, TOR_SOCKS_HOST);
     });
   }
-
-  /**
-   * Get platform-specific Tor download URL
-   */
+  async function isTorListening(): Promise<boolean> {
+    for (let attempt = 0; attempt < 3; attempt++) {
+      if (await probeTorOnce()) return true;
+      if (attempt < 2) await sleep(250);
+    }
+    return false;
+  }
   function getTorDownloadUrl(): string | null {
+    const urls = getTorDownloadUrls();
+    return urls[0] ?? null;
+  }
+  function torDownloadUrlsFor(file: string, version: string): string[] {
+    return [
+      `https://archive.torproject.org/tor-package-archive/torbrowser/${version}/${file}`,
+      `https://dist.torproject.org/torbrowser/${version}/${file}`,
+    ];
+  }
+  function getTorDownloadUrls(): string[] {
     const platform = process.platform;
     const arch = process.arch;
-
     let torPlatform: string;
     let torArch: string;
-
     switch (platform) {
       case "linux":
         torPlatform = "linux";
@@ -429,9 +420,8 @@ export default function (pi: ExtensionAPI) {
         torPlatform = "macos";
         break;
       default:
-        return null;
+        return [];
     }
-
     switch (arch) {
       case "x64":
         torArch = "x86_64";
@@ -440,20 +430,16 @@ export default function (pi: ExtensionAPI) {
         torArch = "aarch64";
         break;
       default:
-        return null;
+        return [];
     }
-
     const version = "14.5.3";
     const alphaVersion = "16.0a7";
-
-    const stableUrl = `https://archive.torproject.org/tor-package-archive/torbrowser/${version}/tor-expert-bundle-${torPlatform}-${torArch}-${version}.tar.gz`;
-    const alphaUrl = `https://archive.torproject.org/tor-package-archive/torbrowser/${alphaVersion}/tor-expert-bundle-${torPlatform}-${torArch}-${alphaVersion}.tar.gz`;
-
+    const stableFile = `tor-expert-bundle-${torPlatform}-${torArch}-${version}.tar.gz`;
+    const alphaFile = `tor-expert-bundle-${torPlatform}-${torArch}-${alphaVersion}.tar.gz`;
     if (platform === "linux" && arch === "arm64") {
-      return alphaUrl;
+      return torDownloadUrlsFor(alphaFile, alphaVersion);
     }
-
-    return stableUrl;
+    return torDownloadUrlsFor(stableFile, version);
   }
 
   async function sha256File(path: string): Promise<string> {
@@ -462,82 +448,107 @@ export default function (pi: ExtensionAPI) {
     return hash.digest("hex");
   }
 
-  /**
-   * Download and extract Tor binary
-   */
-  async function downloadTor(
-    notify: Notify
-  ): Promise<string | null> {
-    const url = getTorDownloadUrl();
-    if (!url) {
+  async function downloadTor(notify: Notify): Promise<string | null> {
+    const urls = getTorDownloadUrls();
+    if (urls.length === 0) {
       notify(`Unsupported platform: ${process.platform}/${process.arch}`, "error");
       return null;
     }
-
     notify("Downloading Tor... (first time only, ~30MB)", "info");
-
     const tarPath = join(TOR_DIR, "tor.tar.gz");
+    let downloadedUrl: string | null = null;
+    let lastError: unknown = null;
     try {
       mkdirSync(TOR_DIR, { recursive: true });
-
-      const response = await fetch(url, { signal: AbortSignal.timeout(120_000) });
-      if (!response.ok) {
-        throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+    } catch (err) {
+      notify(`Download failed: ${err instanceof Error ? err.message : String(err)}`, "error");
+      return null;
+    }
+    for (const url of urls) {
+      let success = false;
+      for (let attempt = 0; attempt < 2; attempt++) {
+        try {
+          let existingSize = 0;
+          try {
+            existingSize = statSync(tarPath).size;
+          } catch {}
+          const headers: Record<string, string> = {};
+          if (existingSize > 0) headers["Range"] = `bytes=${existingSize}-`;
+          const response = await fetch(url, { headers, signal: AbortSignal.timeout(120_000) });
+          if (existingSize > 0 && response.status === 416) {
+            rmSync(tarPath, { force: true });
+            throw new Error("HTTP 416: Range not satisfiable");
+          }
+          const isResume = response.status === 206 && existingSize > 0;
+          if (!isResume && !response.ok) throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+          if (!response.body) throw new Error("Empty response body");
+          const fileStream = createWriteStream(tarPath, { flags: isResume ? "a" : "w" });
+          await pipeline(Readable.fromWeb(response.body as any), fileStream);
+          const fileName = url.split("/").pop() ?? "";
+          const expectedSha = TOR_BUNDLE_SHA256[fileName];
+          if (!expectedSha) {
+            try { rmSync(tarPath, { force: true }); } catch {}
+            throw new Error(`No pinned SHA-256 for ${fileName}`);
+          }
+          const actualSha = await sha256File(tarPath);
+          if (actualSha !== expectedSha) {
+            try { rmSync(tarPath, { force: true }); } catch {}
+            throw new Error(`Checksum mismatch for ${fileName}: expected ${expectedSha}, got ${actualSha}`);
+          }
+          downloadedUrl = url;
+          success = true;
+          break;
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err);
+          lastError = new Error(`${url}: ${message}`);
+          if (attempt === 0) await sleep(500);
+        }
       }
-      if (!response.body) {
-        throw new Error("Empty response body");
-      }
-
-      const fileStream = createWriteStream(tarPath);
-
-      await pipeline(Readable.fromWeb(response.body as any), fileStream);
-
-      const fileName = url.split("/").pop() ?? "";
-      const expectedSha = TOR_BUNDLE_SHA256[fileName];
-      if (!expectedSha) {
-        throw new Error(`No pinned SHA-256 for ${fileName}`);
-      }
-      const actualSha = await sha256File(tarPath);
-      if (actualSha !== expectedSha) {
-        throw new Error(`Checksum mismatch for ${fileName}: expected ${expectedSha}, got ${actualSha}`);
-      }
-
-      notify("Extracting Tor...", "info");
-
+      if (success) break;
+      try {
+        rmSync(tarPath, { force: true });
+      } catch {}
+    }
+    if (!downloadedUrl) {
+      notify(`Download failed: ${lastError instanceof Error ? lastError.message : String(lastError)}`, "error");
+      try {
+        rmSync(tarPath, { force: true });
+      } catch {}
+      return null;
+    }
+    notify("Extracting Tor...", "info");
+    try {
       await new Promise<void>((resolve, reject) => {
-        const child = spawn("tar", ["-xzf", tarPath, "-C", TOR_DIR], {
-          stdio: ["ignore", "ignore", "pipe"],
-        });
+        const child = spawn("tar", ["-xzf", tarPath, "-C", TOR_DIR], { stdio: ["ignore", "ignore", "pipe"] });
         let stderr = "";
-        child.stderr?.on("data", (d: Buffer) => { stderr += d.toString(); });
+        child.stderr?.on("data", (d: Buffer) => {
+          stderr += d.toString();
+        });
         child.on("close", (code) => {
           if (code === 0) resolve();
           else reject(new Error(`tar exited with code ${code}: ${stderr.trim()}`));
         });
         child.on("error", reject);
       });
-
-      const torBin = findTorBinary();
-      if (torBin) {
-        chmodSync(torBin, 0o755);
-        rmSync(tarPath);
-        notify("Tor downloaded.", "info");
-        return torBin;
-      }
-
-      notify("Tor binary not found after extraction", "error");
-      rmSync(tarPath, { force: true });
-      return null;
     } catch (err) {
       notify(`Download failed: ${err instanceof Error ? err.message : String(err)}`, "error");
-      rmSync(tarPath, { force: true });
+      try {
+        rmSync(tarPath, { force: true });
+      } catch {}
       return null;
     }
+    const torBin = findTorBinary();
+    if (torBin) {
+      chmodSync(torBin, 0o755);
+      rmSync(tarPath);
+      notify("Tor downloaded.", "info");
+      return torBin;
+    }
+    notify("Tor binary not found after extraction", "error");
+    rmSync(tarPath, { force: true });
+    return null;
   }
 
-  /**
-   * Find existing Tor binary
-   */
   function findTorBinary(): string | null {
     const locations = [
       join(TOR_DIR, "tor", "tor"),
@@ -577,9 +588,6 @@ export default function (pi: ExtensionAPI) {
     }
   }
 
-  /**
-   * Start Tor process and wait for bootstrap
-   */
   function removePartialDescriptorCache(): void {
     try {
       rmSync(join(TOR_DATA_DIR, "cached-microdescs.new"), { force: true });
@@ -744,9 +752,6 @@ export default function (pi: ExtensionAPI) {
     }
   }
 
-  /**
-   * Stop Tor process
-   */
   async function killTorProcess(): Promise<void> {
     const child = state.torProcess;
     const pid = state.torPid ?? readTorPid();
@@ -826,9 +831,6 @@ export default function (pi: ExtensionAPI) {
     return null;
   }
 
-  /**
-   * Request new Tor circuit (new identity)
-   */
   function readControlPort(): number | null {
     try {
       const raw = readFileSync(TOR_CONTROL_PORT_FILE, "utf8").trim();
@@ -1075,7 +1077,6 @@ export default function (pi: ExtensionAPI) {
     }
   }
 
-  // Register commands
   pi.registerCommand("tor-start", {
     description: "Enable Tor mode (downloads on first run)",
     handler: async (_args, ctx) => {

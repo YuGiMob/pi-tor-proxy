@@ -105,24 +105,22 @@ function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise
   ]);
 }
 
-function isListening(port: number): Promise<boolean> {
-  return new Promise((resolve) => {
+function probeOnce(port: number): Promise<boolean> {
+  return new Promise<boolean>((resolve) => {
     const socket = new net.Socket();
     socket.setTimeout(1500);
-    socket.on("connect", () => {
-      socket.destroy();
-      resolve(true);
-    });
-    socket.on("timeout", () => {
-      socket.destroy();
-      resolve(false);
-    });
-    socket.on("error", () => {
-      socket.destroy();
-      resolve(false);
-    });
+    socket.on("connect", () => { socket.destroy(); resolve(true); });
+    socket.on("timeout", () => { socket.destroy(); resolve(false); });
+    socket.on("error", () => { socket.destroy(); resolve(false); });
     socket.connect(port, "127.0.0.1");
   });
+}
+async function isListening(port: number): Promise<boolean> {
+  for (let attempt = 0; attempt < 3; attempt++) {
+    if (await probeOnce(port)) return true;
+    if (attempt < 2) await sleep(250);
+  }
+  return false;
 }
 
 async function main(): Promise<void> {
@@ -184,6 +182,11 @@ async function main(): Promise<void> {
     assert(process.env.HTTP_PROXY === httpProxy, "turn_start dropped proxy env");
     assert(process.env.NO_PROXY === noProxy, "turn_start dropped NO_PROXY");
 
+    console.log("Checking isListening retry resilience...");
+    const probes = await Promise.all([isListening(SOCKS_PORT), isListening(SOCKS_PORT), isListening(SOCKS_PORT)]);
+    assert(probes.every((v) => v), "isListening retry failed under concurrent probes");
+    const startMarker = join(root, ".tor", "data", "starting");
+    assert(!existsSync(startMarker), "starting marker not cleared after tor-start");
     console.log("Checking /tor-status...");
     notifications.length = 0;
     await withTimeout(Promise.resolve(command("tor-status").handler("", ctx)), 60_000, "tor-status");
