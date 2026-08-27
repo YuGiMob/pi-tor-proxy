@@ -153,11 +153,16 @@ export default function (pi: ExtensionAPI) {
       return null;
     }
   }
+  function removeBestEffort(path: string): void {
+    try {
+      rmSync(path, { force: true });
+    } catch {}
+  }
 
   function rotateTorLogIfLarge(): void {
     try {
       if (statSync(TOR_LOG_FILE).size < MAX_TOR_LOG_BYTES) return;
-      rmSync(`${TOR_LOG_FILE}.1`, { force: true });
+      removeBestEffort(`${TOR_LOG_FILE}.1`);
       renameSync(TOR_LOG_FILE, `${TOR_LOG_FILE}.1`);
     } catch {}
   }
@@ -179,9 +184,7 @@ export default function (pi: ExtensionAPI) {
   function clearStartingMarker(): void {
     if (!startingMarkerWritten) return;
     startingMarkerWritten = false;
-    try {
-      rmSync(TOR_STARTING_FILE, { force: true });
-    } catch {}
+    removeBestEffort(TOR_STARTING_FILE);
   }
 
   function startingInProgress(): boolean {
@@ -192,7 +195,9 @@ export default function (pi: ExtensionAPI) {
   }
 
   function envIsSet(): boolean {
-    return process.env.HTTP_PROXY === TOR_SOCKS_PROXY;
+    for (const v of PROXY_ENV_VARS) if (process.env[v] === TOR_SOCKS_PROXY) return true;
+    for (const v of DNS_PROXY_ENV_VARS) if (process.env[v] === TOR_SOCKS_PROXY_DNS) return true;
+    return false;
   }
 
   interface CountryConfig {
@@ -256,7 +261,7 @@ export default function (pi: ExtensionAPI) {
         try {
           const raw = JSON.parse(readFileSync(join(LEASE_DIR, file), "utf8")) as { updatedAt?: unknown };
           if (typeof raw?.updatedAt === "number" && now - raw.updatedAt >= LEASE_TTL_MS) {
-            rmSync(join(LEASE_DIR, file), { force: true });
+            removeBestEffort(join(LEASE_DIR, file));
           }
         } catch {}
       }
@@ -397,10 +402,6 @@ export default function (pi: ExtensionAPI) {
     }
     return false;
   }
-  function getTorDownloadUrl(): string | null {
-    const urls = getTorDownloadUrls();
-    return urls[0] ?? null;
-  }
   function torDownloadUrlsFor(file: string, version: string): string[] {
     return [
       `https://archive.torproject.org/tor-package-archive/torbrowser/${version}/${file}`,
@@ -476,7 +477,7 @@ export default function (pi: ExtensionAPI) {
           if (existingSize > 0) headers["Range"] = `bytes=${existingSize}-`;
           const response = await fetch(url, { headers, signal: AbortSignal.timeout(120_000) });
           if (existingSize > 0 && response.status === 416) {
-            rmSync(tarPath, { force: true });
+            removeBestEffort(tarPath);
             throw new Error("HTTP 416: Range not satisfiable");
           }
           const isResume = response.status === 206 && existingSize > 0;
@@ -487,12 +488,12 @@ export default function (pi: ExtensionAPI) {
           const fileName = url.split("/").pop() ?? "";
           const expectedSha = TOR_BUNDLE_SHA256[fileName];
           if (!expectedSha) {
-            try { rmSync(tarPath, { force: true }); } catch {}
+            removeBestEffort(tarPath);
             throw new Error(`No pinned SHA-256 for ${fileName}`);
           }
           const actualSha = await sha256File(tarPath);
           if (actualSha !== expectedSha) {
-            try { rmSync(tarPath, { force: true }); } catch {}
+            removeBestEffort(tarPath);
             throw new Error(`Checksum mismatch for ${fileName}: expected ${expectedSha}, got ${actualSha}`);
           }
           downloadedUrl = url;
@@ -505,15 +506,11 @@ export default function (pi: ExtensionAPI) {
         }
       }
       if (success) break;
-      try {
-        rmSync(tarPath, { force: true });
-      } catch {}
+      removeBestEffort(tarPath);
     }
     if (!downloadedUrl) {
       notify(`Download failed: ${lastError instanceof Error ? lastError.message : String(lastError)}`, "error");
-      try {
-        rmSync(tarPath, { force: true });
-      } catch {}
+      removeBestEffort(tarPath);
       return null;
     }
     notify("Extracting Tor...", "info");
@@ -532,20 +529,18 @@ export default function (pi: ExtensionAPI) {
       });
     } catch (err) {
       notify(`Download failed: ${err instanceof Error ? err.message : String(err)}`, "error");
-      try {
-        rmSync(tarPath, { force: true });
-      } catch {}
+      removeBestEffort(tarPath);
       return null;
     }
     const torBin = findTorBinary();
     if (torBin) {
       chmodSync(torBin, 0o755);
-      rmSync(tarPath);
+      removeBestEffort(tarPath);
       notify("Tor downloaded.", "info");
       return torBin;
     }
     notify("Tor binary not found after extraction", "error");
-    rmSync(tarPath, { force: true });
+    removeBestEffort(tarPath);
     return null;
   }
 
@@ -589,9 +584,7 @@ export default function (pi: ExtensionAPI) {
   }
 
   function removePartialDescriptorCache(): void {
-    try {
-      rmSync(join(TOR_DATA_DIR, "cached-microdescs.new"), { force: true });
-    } catch {}
+    removeBestEffort(join(TOR_DATA_DIR, "cached-microdescs.new"));
   }
 
   function prepareTorStart(): void {
@@ -601,11 +594,8 @@ export default function (pi: ExtensionAPI) {
   }
 
   function clearDescriptorCache(): void {
-    for (const name of ["cached-microdescs.new", "cached-microdescs", "cached-microdesc-consensus", "cached-certs"]) {
-      try {
-        rmSync(join(TOR_DATA_DIR, name), { force: true });
-      } catch {}
-    }
+    for (const name of ["cached-microdescs.new", "cached-microdescs", "cached-microdesc-consensus", "cached-certs"])
+      removeBestEffort(join(TOR_DATA_DIR, name));
   }
 
   function startTor(torBin: string): Promise<string | null> {
@@ -892,7 +882,7 @@ export default function (pi: ExtensionAPI) {
         socket.write(`AUTHENTICATE ${cookie.toString("hex")}\r\n`);
         for (const cmd of commands) socket.write(`${cmd}\r\n`);
         socket.write("QUIT\r\n");
-        expected = commands.length + 1;
+        expected = commands.length;
       });
 
       socket.on("data", (chunk: Buffer) => {
@@ -971,13 +961,13 @@ export default function (pi: ExtensionAPI) {
     const deadline = Date.now() + timeoutMs;
     let lastIp: string | null = null;
     while (Date.now() < deadline) {
-      if (!state.enabled) break;
+      if (!state.enabled) return null;
       const ip = await getTorIp();
       if (ip) lastIp = ip;
       if (ip && ip !== oldIp) return ip;
       await sleep(2000);
     }
-    return lastIp;
+    return state.enabled ? lastIp : null;
   }
 
   async function renewTorCircuit(): Promise<boolean> {
