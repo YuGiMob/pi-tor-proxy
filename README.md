@@ -36,9 +36,9 @@ pi install /path/to/pi-tor-proxy
 
 ## How it works
 
-1. The first `/tor-start` downloads the Tor expert bundle (~30MB) from `archive.torproject.org` and verifies its SHA-256 checksum against a pinned digest
+1. The first `/tor-start` downloads the Tor expert bundle (~30MB) from `archive.torproject.org` (fallback `dist.torproject.org`) with resume, per-PID atomic temp file and pinned SHA-256 verification
 2. The binary is stored in the extension's `.tor/` directory
-3. The extension starts Tor and waits for it to finish bootstrapping (typically 10-15 seconds). A start that shows no bootstrap progress for 30 seconds is treated as stalled, the stale descriptor cache left by an interrupted run is cleared, and startup is retried once automatically
+3. The extension picks the first free SOCKS port in `9050–9060` (persisted in `.tor/data/socks.port` and reused if still listening, otherwise the first listening or free port in the range is adopted), starts Tor with `SocksPort 127.0.0.1:<port> IsolateSOCKSAuth` and waits for bootstrap (typically 10-15 seconds). A start with no bootstrap progress for 30 seconds is treated as stalled, a busy port is retried on the next free port, and the stale descriptor cache left by an interrupted run is cleared with one automatic retry. Liveness is verified with a real SOCKS5 handshake and 3× retry
 4. It sets proxy environment variables that most HTTP clients respect
 5. The footer shows `🔒 Tor (IP: x.x.x.x)` when active
 
@@ -46,20 +46,24 @@ Tor writes a persistent log to `.tor/data/tor.log` (rotated to `tor.log.1` past 
 
 ### Environment variables
 
-When Tor mode is active, the extension sets:
-- `HTTP_PROXY=socks5://pi-<id>:x@127.0.0.1:9050`
-- `HTTPS_PROXY=socks5://pi-<id>:x@127.0.0.1:9050`
-- `ALL_PROXY=socks5h://pi-<id>:x@127.0.0.1:9050`
+When Tor mode is active, the extension sets (where `<port>` is the resolved port in `9050–9060`):
+- `HTTP_PROXY=socks5://pi-<id>:x@127.0.0.1:<port>`
+- `HTTPS_PROXY=socks5://pi-<id>:x@127.0.0.1:<port>`
+- `ALL_PROXY=socks5h://pi-<id>:x@127.0.0.1:<port>`
 - `NO_PROXY=127.0.0.1,localhost,::1`
 - lowercase variants as well
 
+The resolved port is persisted in `.tor/data/socks.port` so restarts and other pi instances sharing the same installation adopt the same port when it is still listening.
+
 Loopback addresses are excluded via `NO_PROXY` so local tools (MCP servers, dev servers, local APIs the agent spawns) never go through Tor — Tor refuses private-address connections anyway, and proxying them would break local tooling.
 
-`<id>` is a random identifier generated per pi instance. Tor's `IsolateSOCKSAuth` (on by default) never shares circuits between streams with different SOCKS authentication, so each pi instance gets its own circuit and exit IP. `/tor-cycle` sends a global NEWNYM signal that refreshes all circuits, so other instances are re-routed too — each onto its own separate circuit.
+`<id>` is a random identifier generated per pi instance. Tor's `IsolateSOCKSAuth` is enforced on the `SocksPort` line so circuits are never shared between streams with different SOCKS authentication, so each pi instance gets its own circuit and exit IP. `/tor-cycle` sends a global NEWNYM signal that refreshes all circuits, so other instances are re-routed too — each onto its own separate circuit.
 
 The `HTTP(S)_PROXY` values use `socks5://` because undici — the HTTP client used by pi and by Node-based tools — only recognizes that scheme; it forwards hostnames to the proxy, so DNS is still resolved through Tor. The `ALL_PROXY` values keep the `socks5h://` scheme so tools that fall back to `ALL_PROXY` also resolve DNS through Tor. Note that curl-family tools prefer the protocol-specific `HTTP(S)_PROXY` values, and those resolve DNS locally.
 
-The variables take effect in the pi process's environment, so subprocesses spawned while Tor mode is active — tool executions, shell commands, Node scripts — are routed through Tor. pi's own in-process HTTP client reads proxy variables once at startup, so it is only routed when the variables were already set before pi was launched.
+The variables take effect in the pi process's environment, so subprocesses spawned while Tor mode is active — tool executions, shell commands, Node scripts — are routed through Tor. pi's own in-process HTTP client is reconfigured via its `http-dispatcher` and `EnvHttpProxyAgent` fallback, so in-process fetches also go through Tor once the environment is set.
+
+Exit IP is verified strictly against `https://check.torproject.org/api/ip` (`IsTor === true` required) via `undici` `ProxyAgent` with `curl` fallback; no unverified fallback provider is used.
 
 ### Getting a new IP
 
@@ -70,9 +74,12 @@ The variables take effect in the pi process's environment, so subprocesses spawn
 `/tor-country <cc>` pins all exits to a country (e.g. `/tor-country us`), `/tor-exclude <cc>` never uses exits in a country (e.g. `/tor-exclude ru`), and `off` clears either setting. `/tor-status` shows the active configuration.
 
 The setting is applied to the running Tor over its control port (strictly, with `StrictNodes` for pins) and a fresh circuit is built immediately. It is also persisted in `.tor/data/country` and re-applied on every Tor start, so it survives crashes and restarts. Country codes are 2-letter ISO 3166-1 codes; country-based selection needs the GeoIP database, which the extension passes to Tor on every start.
+
 ### Multiple pi instances
 
-Tor mode is shared across pi instances using the same extension installation: the desired state is stored in `.tor/data/enabled`, and each instance applies it to its own environment at turn boundaries. Stopping Tor in one instance lets the other instances finish their current turn through Tor before switching off; starting it takes effect from the next turn. The shared Tor process is only stopped once no instance is actively routing through it. Each instance authenticates with its own random SOCKS username, so their traffic travels over separate circuits with separate exit IPs.
+Tor mode is shared across pi instances using the same extension installation: the desired state is stored in `.tor/data/enabled` and each instance applies it to its own environment at turn boundaries. Stopping Tor in one instance lets the other instances finish their current turn through Tor before switching off; starting it takes effect from the next turn. The shared Tor process is only stopped once no instance is actively routing through it. Each instance authenticates with its own random SOCKS username, so their traffic travels over separate circuits with separate exit IPs.
+
+A pid-aware starting marker (`.tor/data/starting` as `pid:timestamp` with liveness check) prevents one instance from killing another's bootstrapping Tor, and per-instance lease files (`.tor/leases/<pid>.json` reaped by `updatedAt` or `mtime` fallback) track which instances still need Tor. `kill` and bootstrap lifecycle are guarded by exact `isTorProcess` checks and bounded log buffers.
 
 ## Supported platforms
 
@@ -103,7 +110,7 @@ Run the smoke test — it loads the extension with a mock pi API, starts a real 
 npm run smoke
 ```
 
-Add `--cycle` to also exercise circuit rotation (NEWNYM) and exit-country configuration. The smoke test needs the Tor bundle (run `/tor-start` once first), outbound access to the Tor network, and Node ≥ 23.6.
+Add `--cycle` to also exercise circuit rotation (NEWNYM) and exit-country configuration. The smoke test is dynamic-port aware (reads `.tor/data/socks.port`, probes via SOCKS5 handshake, validates `socks5://pi-XXXXXXXX:x@127.0.0.1:9050–9060`) and needs the Tor bundle (run `/tor-start` once first), outbound access to the Tor network, and Node ≥ 23.6.
 
 ## Credits
 
