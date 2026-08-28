@@ -649,10 +649,22 @@ export default function (pi: ExtensionAPI) {
     }
     notify("Downloading Tor... (first time only, ~30MB)", "info");
     const tarPath = join(TOR_DIR, "tor.tar.gz");
+    const tmpPath = join(TOR_DIR, `tor.${process.pid}.tar.gz.tmp`);
     let downloadedUrl: string | null = null;
     let lastError: unknown = null;
     try {
       mkdirSync(TOR_DIR, { recursive: true });
+      try {
+        for (const file of readdirSync(TOR_DIR)) {
+          if (!file.startsWith("tor.") || !file.endsWith(".tar.gz.tmp")) continue;
+          if (file === `tor.${process.pid}.tar.gz.tmp`) continue;
+          try {
+            const full = join(TOR_DIR, file);
+            const age = Date.now() - statSync(full).mtimeMs;
+            if (age > 3600000) removeBestEffort(full);
+          } catch {}
+        }
+      } catch {}
     } catch (err) {
       notify(`Download failed: ${formatError(err)}`, "error");
       return null;
@@ -663,7 +675,7 @@ export default function (pi: ExtensionAPI) {
         try {
           let existingSize = 0;
           try {
-            existingSize = statSync(tarPath).size;
+            existingSize = statSync(tmpPath).size;
           } catch {}
           const headers: Record<string, string> = {};
           if (existingSize > 0) headers["Range"] = `bytes=${existingSize}-`;
@@ -672,29 +684,35 @@ export default function (pi: ExtensionAPI) {
             signal: AbortSignal.timeout(120_000),
           });
           if (existingSize > 0 && response.status === 416) {
-            removeBestEffort(tarPath);
+            removeBestEffort(tmpPath);
             throw new Error("HTTP 416: Range not satisfiable");
           }
           const isResume = response.status === 206 && existingSize > 0;
           if (!isResume && !response.ok)
             throw new Error(`HTTP ${response.status}: ${response.statusText}`);
           if (!response.body) throw new Error("Empty response body");
-          const fileStream = createWriteStream(tarPath, {
+          const fileStream = createWriteStream(tmpPath, {
             flags: isResume ? "a" : "w",
           });
           await pipeline(Readable.fromWeb(response.body as never), fileStream);
           const fileName = url.split("/").pop() ?? "";
           const expectedSha = TOR_BUNDLE_SHA256[fileName];
           if (!expectedSha) {
-            removeBestEffort(tarPath);
+            removeBestEffort(tmpPath);
             throw new Error(`No pinned SHA-256 for ${fileName}`);
           }
-          const actualSha = await sha256File(tarPath);
+          const actualSha = await sha256File(tmpPath);
           if (actualSha !== expectedSha) {
-            removeBestEffort(tarPath);
+            removeBestEffort(tmpPath);
             throw new Error(
               `Checksum mismatch for ${fileName}: expected ${expectedSha}, got ${actualSha}`,
             );
+          }
+          try {
+            renameSync(tmpPath, tarPath);
+          } catch (err) {
+            removeBestEffort(tmpPath);
+            throw err;
           }
           downloadedUrl = url;
           success = true;
@@ -706,11 +724,11 @@ export default function (pi: ExtensionAPI) {
         }
       }
       if (success) break;
-      removeBestEffort(tarPath);
+      removeBestEffort(tmpPath);
     }
     if (!downloadedUrl) {
       notify(`Download failed: ${formatError(lastError)}`, "error");
-      removeBestEffort(tarPath);
+      removeBestEffort(tmpPath);
       return null;
     }
     notify("Extracting Tor...", "info");
@@ -732,17 +750,20 @@ export default function (pi: ExtensionAPI) {
       });
     } catch (err) {
       notify(`Download failed: ${formatError(err)}`, "error");
+      removeBestEffort(tmpPath);
       removeBestEffort(tarPath);
       return null;
     }
     const torBin = findTorBinary();
     if (torBin) {
       chmodSync(torBin, 0o755);
+      removeBestEffort(tmpPath);
       removeBestEffort(tarPath);
       notify("Tor downloaded.", "info");
       return torBin;
     }
     notify("Tor binary not found after extraction", "error");
+    removeBestEffort(tmpPath);
     removeBestEffort(tarPath);
     return null;
   }
@@ -938,7 +959,7 @@ export default function (pi: ExtensionAPI) {
         if (!resolved) {
           resolved = true;
           clearInterval(watchdog);
-          resolve(`Failed to start Tor: ${err.message}`);
+          resolve(`Failed to start Tor: ${formatError(err)}`);
         }
       });
     }).finally(() => {
