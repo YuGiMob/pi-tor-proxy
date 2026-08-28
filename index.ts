@@ -222,6 +222,9 @@ export default function (pi: ExtensionAPI) {
       rmSync(path, { force: true });
     } catch {}
   }
+  function persistFile(path: string, content: string, label: string): void {
+    if (!writeFileBestEffort(path, content)) console.error(label);
+  }
 
   function rotateTorLogIfLarge(): void {
     try {
@@ -232,7 +235,7 @@ export default function (pi: ExtensionAPI) {
   }
 
   function persistEnabled(enabled: boolean): void {
-    if (!writeFileBestEffort(TOR_STATE_FILE, enabled ? "1" : "0")) console.error("Failed to persist Tor state");
+    persistFile(TOR_STATE_FILE, enabled ? "1" : "0", "Failed to persist Tor state");
   }
 
   function readPersistedEnabled(): boolean {
@@ -303,7 +306,7 @@ export default function (pi: ExtensionAPI) {
   }
 
   function writeCountryConfig(config: CountryConfig): void {
-    if (!writeFileBestEffort(TOR_COUNTRY_FILE, JSON.stringify(config))) console.error("Failed to persist Tor country config");
+    persistFile(TOR_COUNTRY_FILE, JSON.stringify(config), "Failed to persist Tor country config");
   }
   function getBracedCountry(cc: string | null): string | null {
     return cc ? `{${cc}}` : null;
@@ -333,23 +336,22 @@ export default function (pi: ExtensionAPI) {
     updatedAt: number;
   }
 
-  function readLeaseFile(name: string): InstanceLease | null {
+  function readJsonSafe(path: string): unknown | null {
+    const raw = readFileSafe(path);
+    if (!raw) return null;
     try {
-      const lease = JSON.parse(
-        readFileSync(join(LEASE_DIR, name), "utf8"),
-      ) as InstanceLease;
-      if (
-        lease &&
-        typeof lease.pid === "number" &&
-        typeof lease.envSet === "boolean" &&
-        typeof lease.updatedAt === "number"
-      )
-        return lease;
-    } catch {}
-    return null;
+      return JSON.parse(raw);
+    } catch {
+      return null;
+    }
   }
   function leaseFilePath(name: string): string {
     return join(LEASE_DIR, name);
+  }
+  function readLeaseFile(name: string): InstanceLease | null {
+    const lease = readJsonSafe(leaseFilePath(name)) as InstanceLease | null;
+    if (lease && typeof lease.pid === "number" && typeof lease.envSet === "boolean" && typeof lease.updatedAt === "number") return lease;
+    return null;
   }
   function isLeaseFile(name: string): boolean {
     return name.endsWith(".json");
@@ -364,10 +366,8 @@ export default function (pi: ExtensionAPI) {
   function isStaleLeaseFile(name: string, now: number): boolean {
     const lease = readLeaseFile(name);
     if (lease) return now - lease.updatedAt >= LEASE_TTL_MS;
-    try {
-      const raw = JSON.parse(readFileSync(leaseFilePath(name), "utf8")) as { updatedAt?: unknown };
-      if (typeof raw?.updatedAt === "number") return now - raw.updatedAt >= LEASE_TTL_MS;
-    } catch {}
+    const raw = readJsonSafe(leaseFilePath(name)) as { updatedAt?: unknown } | null;
+    if (raw && typeof raw.updatedAt === "number") return now - raw.updatedAt >= LEASE_TTL_MS;
     try {
       return now - statSync(leaseFilePath(name)).mtimeMs >= LEASE_TTL_MS;
     } catch {
@@ -412,8 +412,8 @@ export default function (pi: ExtensionAPI) {
 
   async function maybeKillTor(): Promise<void> {
     if (readPersistedEnabled()) return;
-    if (startingInProgress()) return;
     if (cycleInProgress) return;
+    if (startingInProgress()) return;
     if (!(await isTorListening())) return;
     if (anyLiveInstanceNeedsTor()) return;
     await killTorProcess();
@@ -549,7 +549,7 @@ export default function (pi: ExtensionAPI) {
     return isValidPort(n) ? n : null;
   }
   function writePersistedPort(port: number): void {
-    if (!writeFileBestEffort(TOR_SOCKS_PORT_FILE, String(port))) console.error("Failed to persist Tor port");
+    persistFile(TOR_SOCKS_PORT_FILE, String(port), "Failed to persist Tor port");
   }
   function isValidPort(n: number): boolean {
     return Number.isInteger(n) && n > 0 && n <= 65535;
@@ -880,7 +880,11 @@ export default function (pi: ExtensionAPI) {
     if (!country.exitNodes && !country.excludeExitNodes) return;
     removePartialDescriptorCache();
   }
-
+  function clearTorListeners(target: ChildProcess): void {
+    target.stdout?.removeAllListeners();
+    target.stderr?.removeAllListeners();
+    target.removeAllListeners();
+  }
   function clearDescriptorCache(): void {
     for (const name of [
       "cached-microdescs.new",
@@ -900,7 +904,6 @@ export default function (pi: ExtensionAPI) {
         rotateTorLogIfLarge();
         prepareTorStart();
         const torDir = dirname(torBin);
-
         child = spawn(
           torBin,
           [
@@ -942,7 +945,6 @@ export default function (pi: ExtensionAPI) {
         resolve(`Failed to start Tor: ${formatError(err)}`);
         return;
       }
-
       let resolved = false;
       let stdoutBuffer = "";
       let stderrBuffer = "";
@@ -952,6 +954,8 @@ export default function (pi: ExtensionAPI) {
         if (resolved) return;
         resolved = true;
         clearInterval(watchdog);
+        child.stdout?.removeAllListeners();
+        child.stderr?.removeAllListeners();
         child.kill("SIGTERM");
         const deadline = Date.now() + 5000;
         const poll = setInterval(() => {
@@ -971,9 +975,9 @@ export default function (pi: ExtensionAPI) {
           terminateAndResolve("Tor startup stalled (no bootstrap progress)");
         }
       }, 1000);
-
       child.stdout?.on("data", (data: Buffer) => {
         stdoutBuffer += data.toString();
+        if (stdoutBuffer.length > 65536) stdoutBuffer = stdoutBuffer.slice(-32768);
         let newlineIdx: number;
         while ((newlineIdx = stdoutBuffer.indexOf("\n")) >= 0) {
           const line = stdoutBuffer.slice(0, newlineIdx).trim();
@@ -982,6 +986,7 @@ export default function (pi: ExtensionAPI) {
           if (line.includes("Bootstrapped 100%") && !resolved) {
             resolved = true;
             clearInterval(watchdog);
+            child.stdout?.removeAllListeners();
             stdoutBuffer = "";
             state.torProcess = child;
             state.torPid = child.pid ?? null;
@@ -991,19 +996,19 @@ export default function (pi: ExtensionAPI) {
           }
         }
       });
-
       child.stderr?.on("data", (data: Buffer) => {
         const text = data.toString();
         stderrBuffer += text;
+        if (stderrBuffer.length > 8192) stderrBuffer = stderrBuffer.slice(-8192);
         if (text.includes("[err]")) {
           console.error("Tor error:", text);
         }
       });
-
       child.on("close", (code) => {
         if (!resolved) {
           resolved = true;
           clearInterval(watchdog);
+          clearTorListeners(child);
           const detail = stderrBuffer.trim().split("\n").pop()?.trim();
           const suffix = detail ? `: ${detail}` : "";
           resolve(`Tor exited with code ${code}${suffix}`);
@@ -1011,11 +1016,11 @@ export default function (pi: ExtensionAPI) {
         if (state.torProcess === child) state.torProcess = null;
         if (state.torPid === child.pid) state.torPid = null;
       });
-
       child.on("error", (err) => {
         if (!resolved) {
           resolved = true;
           clearInterval(watchdog);
+          clearTorListeners(child);
           resolve(`Failed to start Tor: ${formatError(err)}`);
         }
       });
@@ -1072,8 +1077,6 @@ export default function (pi: ExtensionAPI) {
   async function killTorProcess(): Promise<void> {
     const child = state.torProcess;
     const pid = state.torPid ?? readTorPid();
-    state.torProcess = null;
-    state.torPid = null;
     if (child) {
       child.kill("SIGTERM");
     } else if (pid && isTorProcess(pid)) {
@@ -1081,6 +1084,8 @@ export default function (pi: ExtensionAPI) {
         process.kill(pid, "SIGTERM");
       } catch {}
     } else {
+      state.torProcess = null;
+      state.torPid = null;
       return;
     }
     for (let i = 0; i < 20; i++) {
@@ -1088,6 +1093,8 @@ export default function (pi: ExtensionAPI) {
       const exited = child ? child.exitCode !== null : !(await isTorListening());
       if (exited) break;
     }
+    state.torProcess = null;
+    state.torPid = null;
     if (child) {
       child.kill("SIGKILL");
     } else if (pid && isTorProcess(pid)) {
@@ -1189,7 +1196,7 @@ export default function (pi: ExtensionAPI) {
 
   async function getTorIp(): Promise<string | null> {
     const check = await curlThroughTor("https://check.torproject.org/api/ip");
-    if (!check) return curlThroughTor("https://api.ipify.org");
+    if (!check) return null;
     let parsed: { IsTor?: unknown; IP?: unknown };
     try {
       parsed = JSON.parse(check) as { IsTor?: unknown; IP?: unknown };
