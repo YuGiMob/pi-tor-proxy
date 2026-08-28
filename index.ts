@@ -506,10 +506,18 @@ export default function (pi: ExtensionAPI) {
     const raw = readFileSafe(TOR_SOCKS_PORT_FILE);
     if (!raw) return null;
     const n = Number(raw.trim());
-    return Number.isInteger(n) && n > 0 && n <= 65535 ? n : null;
+    return isValidPort(n) ? n : null;
   }
   function writePersistedPort(port: number): void {
     writeFileBestEffort(TOR_SOCKS_PORT_FILE, String(port));
+  }
+  function isValidPort(n: number): boolean {
+    return Number.isInteger(n) && n > 0 && n <= 65535;
+  }
+  function setSocksPort(port: number, persist: boolean): void {
+    TOR_SOCKS_PORT = port;
+    refreshProxyStrings();
+    if (persist) writePersistedPort(port);
   }
   async function findPort(wantListening: boolean): Promise<number | null> {
     for (let p = 9050; p <= 9060; p++)
@@ -525,26 +533,20 @@ export default function (pi: ExtensionAPI) {
   async function resolveSocksPort(): Promise<number> {
     const persisted = readPersistedPort();
     if (persisted !== null && (await isTorListeningOn(persisted))) {
-      TOR_SOCKS_PORT = persisted;
-      refreshProxyStrings();
+      setSocksPort(persisted, false);
       return persisted;
     }
     const listening = await findListeningPort();
     if (listening !== null) {
-      TOR_SOCKS_PORT = listening;
-      refreshProxyStrings();
-      writePersistedPort(listening);
+      setSocksPort(listening, true);
       return listening;
     }
     const free = await findFreePort();
     if (free !== null) {
-      TOR_SOCKS_PORT = free;
-      refreshProxyStrings();
-      writePersistedPort(free);
+      setSocksPort(free, true);
       return free;
     }
-    TOR_SOCKS_PORT = 9050;
-    refreshProxyStrings();
+    setSocksPort(9050, false);
     return 9050;
   }
   async function syncDispatcher(): Promise<void> {
@@ -632,6 +634,9 @@ export default function (pi: ExtensionAPI) {
     await pipeline(createReadStream(path), hash);
     return hash.digest("hex");
   }
+  function formatError(err: unknown): string {
+    return err instanceof Error ? err.message : String(err);
+  }
 
   async function downloadTor(notify: Notify): Promise<string | null> {
     const urls = getTorDownloadUrls();
@@ -649,10 +654,7 @@ export default function (pi: ExtensionAPI) {
     try {
       mkdirSync(TOR_DIR, { recursive: true });
     } catch (err) {
-      notify(
-        `Download failed: ${err instanceof Error ? err.message : String(err)}`,
-        "error",
-      );
+      notify(`Download failed: ${formatError(err)}`, "error");
       return null;
     }
     for (const url of urls) {
@@ -698,7 +700,7 @@ export default function (pi: ExtensionAPI) {
           success = true;
           break;
         } catch (err) {
-          const message = err instanceof Error ? err.message : String(err);
+          const message = formatError(err);
           lastError = new Error(`${url}: ${message}`);
           if (attempt === 0) await sleep(500);
         }
@@ -707,10 +709,7 @@ export default function (pi: ExtensionAPI) {
       removeBestEffort(tarPath);
     }
     if (!downloadedUrl) {
-      notify(
-        `Download failed: ${lastError instanceof Error ? lastError.message : String(lastError)}`,
-        "error",
-      );
+      notify(`Download failed: ${formatError(lastError)}`, "error");
       removeBestEffort(tarPath);
       return null;
     }
@@ -732,10 +731,7 @@ export default function (pi: ExtensionAPI) {
         child.on("error", reject);
       });
     } catch (err) {
-      notify(
-        `Download failed: ${err instanceof Error ? err.message : String(err)}`,
-        "error",
-      );
+      notify(`Download failed: ${formatError(err)}`, "error");
       removeBestEffort(tarPath);
       return null;
     }
@@ -831,7 +827,7 @@ export default function (pi: ExtensionAPI) {
           torBin,
           [
             "--SocksPort",
-            `${TOR_SOCKS_HOST}:${TOR_SOCKS_PORT}`,
+            `${TOR_SOCKS_HOST}:${TOR_SOCKS_PORT} IsolateSOCKSAuth`,
             "--ControlPort",
             "auto",
             "--ControlPortWriteToFile",
@@ -865,9 +861,7 @@ export default function (pi: ExtensionAPI) {
           },
         );
       } catch (err) {
-        resolve(
-          `Failed to start Tor: ${err instanceof Error ? err.message : String(err)}`,
-        );
+        resolve(`Failed to start Tor: ${formatError(err)}`);
         return;
       }
 
@@ -964,11 +958,7 @@ export default function (pi: ExtensionAPI) {
       failure.includes("Could not bind");
     if (portConflict) {
       const free = await findFreePort();
-      if (free !== null) {
-        TOR_SOCKS_PORT = free;
-        refreshProxyStrings();
-        writePersistedPort(free);
-      }
+      if (free !== null) setSocksPort(free, true);
       const retryPort = await startTor(torBin);
       if (!retryPort) return null;
       return (await isTorListening()) ? null : retryPort;
@@ -1141,7 +1131,7 @@ export default function (pi: ExtensionAPI) {
       const raw = readFileSync(TOR_CONTROL_PORT_FILE, "utf8").trim();
       const match = raw.match(/PORT=(?:.*:)?(\d{1,5})$/);
       const port = match ? Number(match[1]) : Number(raw);
-      return Number.isInteger(port) && port > 0 && port <= 65535 ? port : null;
+      return isValidPort(port) ? port : null;
     } catch {
       return null;
     }
