@@ -11,7 +11,7 @@ const root = join(__dirname, "..");
 const TOR_BIN = join(root, ".tor", "tor", "tor");
 const TOR_STATE_FILE = join(root, ".tor", "data", "enabled");
 const TOR_COUNTRY_FILE = join(root, ".tor", "data", "country");
-const SOCKS_PORT = 9050;
+const TOR_SOCKS_PORT_FILE = join(root, ".tor", "data", "socks.port");
 
 interface Notification {
   message: string;
@@ -108,10 +108,27 @@ function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise
 function probeOnce(port: number): Promise<boolean> {
   return new Promise<boolean>((resolve) => {
     const socket = new net.Socket();
+    let settled = false;
+    let buffer = Buffer.alloc(0);
+    const settle = (value: boolean) => {
+      if (settled) return;
+      settled = true;
+      socket.destroy();
+      resolve(value);
+    };
     socket.setTimeout(1500);
-    socket.on("connect", () => { socket.destroy(); resolve(true); });
-    socket.on("timeout", () => { socket.destroy(); resolve(false); });
-    socket.on("error", () => { socket.destroy(); resolve(false); });
+    socket.on("timeout", () => settle(false));
+    socket.on("error", () => settle(false));
+    socket.on("close", () => settle(false));
+    socket.on("data", (data: Buffer) => {
+      buffer = Buffer.concat([buffer, data]);
+      if (buffer.length < 2) return;
+      if (buffer[0] === 0x05 && (buffer[1] === 0x00 || buffer[1] === 0x02)) settle(true);
+      else settle(false);
+    });
+    socket.on("connect", () => {
+      socket.write(Buffer.from([0x05, 0x01, 0x00]));
+    });
     socket.connect(port, "127.0.0.1");
   });
 }
@@ -121,6 +138,14 @@ async function isListening(port: number): Promise<boolean> {
     if (attempt < 2) await sleep(250);
   }
   return false;
+}
+function getSocksPort(): number {
+  const raw = readFileSafe(TOR_SOCKS_PORT_FILE);
+  if (raw) {
+    const n = Number(raw.trim());
+    if (Number.isInteger(n) && n > 0 && n <= 65535) return n;
+  }
+  return 9050;
 }
 
 async function main(): Promise<void> {
@@ -158,13 +183,13 @@ async function main(): Promise<void> {
   try {
     console.log("Starting Tor via /tor-start...");
     await withTimeout(Promise.resolve(command("tor-start").handler("", ctx)), 120_000, "tor-start");
-    assert(await isListening(SOCKS_PORT), "SOCKS port not listening after tor-start");
+    assert(await isListening(getSocksPort()), "SOCKS port not listening after tor-start");
     assert(unexpectedErrors().length === 0, `tor-start errors: ${unexpectedErrors().map((n) => n.message).join(" | ")}`);
 
     const httpProxy = process.env.HTTP_PROXY ?? "";
-    assert(httpProxy.startsWith("socks5://pi-") && httpProxy.endsWith("@127.0.0.1:9050"), `unexpected HTTP_PROXY: ${httpProxy}`);
+    assert(/^socks5:\/\/pi-[0-9a-f]{8}:x@127\.0\.0\.1:90(5[0-9]|60)$/.test(httpProxy), `unexpected HTTP_PROXY: ${httpProxy}`);
     const allProxy = process.env.ALL_PROXY ?? "";
-    assert(allProxy.startsWith("socks5h://pi-") && allProxy.endsWith("@127.0.0.1:9050"), `unexpected ALL_PROXY: ${allProxy}`);
+    assert(/^socks5h:\/\/pi-[0-9a-f]{8}:x@127\.0\.0\.1:90(5[0-9]|60)$/.test(allProxy), `unexpected ALL_PROXY: ${allProxy}`);
     const noProxy = process.env.NO_PROXY ?? "";
     assert(
       noProxy.includes("127.0.0.1") && noProxy.includes("localhost") && noProxy.includes("::1"),
@@ -183,7 +208,7 @@ async function main(): Promise<void> {
     assert(process.env.NO_PROXY === noProxy, "turn_start dropped NO_PROXY");
 
     console.log("Checking isListening retry resilience...");
-    const probes = await Promise.all([isListening(SOCKS_PORT), isListening(SOCKS_PORT), isListening(SOCKS_PORT)]);
+    const probes = await Promise.all([isListening(getSocksPort()), isListening(getSocksPort()), isListening(getSocksPort())]);
     assert(probes.every((v) => v), "isListening retry failed under concurrent probes");
     const startMarker = join(root, ".tor", "data", "starting");
     assert(!existsSync(startMarker), "starting marker not cleared after tor-start");
@@ -226,7 +251,7 @@ async function main(): Promise<void> {
       await withTimeout(Promise.resolve(command("tor-stop").handler("", ctx)), 60_000, "tor-stop before cache test");
       writeFileSync(join(root, ".tor", "data", "cached-microdescs.new"), "partial");
       await withTimeout(Promise.resolve(command("tor-start").handler("", ctx)), 120_000, "tor-start after cache poison");
-      assert(await isListening(SOCKS_PORT), "SOCKS port not listening after cache-recovery start");
+      assert(await isListening(getSocksPort()), "SOCKS port not listening after cache-recovery start");
       writeFileBestEffort(TOR_COUNTRY_FILE, JSON.stringify({ exitNodes: null, excludeExitNodes: null }));
       await withTimeout(Promise.resolve(command("tor-country").handler("off", ctx)), 180_000, "tor-country off after cache test");
       assert(unexpectedErrors().length === 0, `cache-recovery errors: ${unexpectedErrors().map((n) => n.message).join(" | ")}`);
@@ -245,7 +270,7 @@ async function main(): Promise<void> {
     const deadline = Date.now() + 15_000;
     let stopped = false;
     while (Date.now() < deadline) {
-      if (!(await isListening(SOCKS_PORT))) {
+      if (!(await isListening(getSocksPort()))) {
         stopped = true;
         break;
       }

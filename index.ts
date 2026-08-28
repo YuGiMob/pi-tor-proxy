@@ -508,18 +508,26 @@ export default function (pi: ExtensionAPI) {
   async function probeTorOnce(port: number = TOR_SOCKS_PORT): Promise<boolean> {
     return new Promise<boolean>((resolve) => {
       const socket = new net.Socket();
+      let settled = false;
+      let buffer = Buffer.alloc(0);
+      const settle = (value: boolean) => {
+        if (settled) return;
+        settled = true;
+        socket.destroy();
+        resolve(value);
+      };
       socket.setTimeout(1500);
+      socket.on("timeout", () => settle(false));
+      socket.on("error", () => settle(false));
+      socket.on("close", () => settle(false));
+      socket.on("data", (data: Buffer) => {
+        buffer = Buffer.concat([buffer, data]);
+        if (buffer.length < 2) return;
+        if (buffer[0] === 0x05 && (buffer[1] === 0x00 || buffer[1] === 0x02)) settle(true);
+        else settle(false);
+      });
       socket.on("connect", () => {
-        socket.destroy();
-        resolve(true);
-      });
-      socket.on("timeout", () => {
-        socket.destroy();
-        resolve(false);
-      });
-      socket.on("error", () => {
-        socket.destroy();
-        resolve(false);
+        socket.write(Buffer.from([0x05, 0x01, 0x00]));
       });
       socket.connect(port, TOR_SOCKS_HOST);
     });
