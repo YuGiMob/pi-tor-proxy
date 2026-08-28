@@ -1,27 +1,51 @@
-import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext, ExtensionUIContext } from "@earendil-works/pi-coding-agent";
+import type {
+  ExtensionAPI,
+  ExtensionCommandContext,
+  ExtensionContext,
+  ExtensionUIContext,
+} from "@earendil-works/pi-coding-agent";
 import { spawn, execFileSync, type ChildProcess } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { chmodSync, createReadStream, createWriteStream, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  createReadStream,
+  createWriteStream,
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  readdirSync,
+  renameSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import net from "node:net";
 import { join, dirname } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { pipeline } from "node:stream/promises";
 import { Readable } from "node:stream";
+import { createRequire } from "node:module";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
 const TOR_SOCKS_HOST = "127.0.0.1";
-const TOR_SOCKS_PORT = 9050;
+let TOR_SOCKS_PORT = 9050;
 const TOR_SOCKS_AUTH_USER = `pi-${randomUUID().slice(0, 8)}`;
 const TOR_SOCKS_AUTH_PASS = "x";
-const TOR_SOCKS_PROXY = `socks5://${TOR_SOCKS_AUTH_USER}:${TOR_SOCKS_AUTH_PASS}@${TOR_SOCKS_HOST}:${TOR_SOCKS_PORT}`;
-const TOR_SOCKS_PROXY_DNS = `socks5h://${TOR_SOCKS_AUTH_USER}:${TOR_SOCKS_AUTH_PASS}@${TOR_SOCKS_HOST}:${TOR_SOCKS_PORT}`;
+let TOR_SOCKS_PROXY = "";
+let TOR_SOCKS_PROXY_DNS = "";
+function refreshProxyStrings(): void {
+  TOR_SOCKS_PROXY = `socks5://${TOR_SOCKS_AUTH_USER}:${TOR_SOCKS_AUTH_PASS}@${TOR_SOCKS_HOST}:${TOR_SOCKS_PORT}`;
+  TOR_SOCKS_PROXY_DNS = `socks5h://${TOR_SOCKS_AUTH_USER}:${TOR_SOCKS_AUTH_PASS}@${TOR_SOCKS_HOST}:${TOR_SOCKS_PORT}`;
+}
+refreshProxyStrings();
 
 const STATUS_KEY = "tor";
 
 const TOR_DIR = join(__dirname, ".tor");
 const TOR_DATA_DIR = join(TOR_DIR, "data");
+const TOR_SOCKS_PORT_FILE = join(TOR_DATA_DIR, "socks.port");
 const TOR_STATE_FILE = join(TOR_DATA_DIR, "enabled");
 const TOR_STARTING_FILE = join(TOR_DATA_DIR, "starting");
 const LEASE_DIR = join(TOR_DIR, "leases");
@@ -36,10 +60,14 @@ const NEWNYM_RATE_LIMIT_MS = 11_000;
 const STARTUP_STALL_MS = 30_000;
 const STARTUP_TIMEOUT_MS = 60_000;
 const TOR_BUNDLE_SHA256: Record<string, string> = {
-  "tor-expert-bundle-linux-x86_64-14.5.3.tar.gz": "34bac6a9cddfbd5cd8e74e546e00dcfa7aa988a19c3b5574ba7b52babe6c6e1a",
-  "tor-expert-bundle-macos-x86_64-14.5.3.tar.gz": "28f1a7355abd17d3ad0cc0438caf0a5c563939115e6e22885ea470a8bda55a27",
-  "tor-expert-bundle-macos-aarch64-14.5.3.tar.gz": "a57479977c07a270390b40bebff6a85f80de3007e0b637d63322e078f09c6ec9",
-  "tor-expert-bundle-linux-aarch64-16.0a7.tar.gz": "1a51b37cc68f2df4d8952d3f343794f2f966c59d84fe580c56192377c00fcc1b",
+  "tor-expert-bundle-linux-x86_64-14.5.3.tar.gz":
+    "34bac6a9cddfbd5cd8e74e546e00dcfa7aa988a19c3b5574ba7b52babe6c6e1a",
+  "tor-expert-bundle-macos-x86_64-14.5.3.tar.gz":
+    "28f1a7355abd17d3ad0cc0438caf0a5c563939115e6e22885ea470a8bda55a27",
+  "tor-expert-bundle-macos-aarch64-14.5.3.tar.gz":
+    "a57479977c07a270390b40bebff6a85f80de3007e0b637d63322e078f09c6ec9",
+  "tor-expert-bundle-linux-aarch64-16.0a7.tar.gz":
+    "1a51b37cc68f2df4d8952d3f343794f2f966c59d84fe580c56192377c00fcc1b",
 };
 const TOR_CONTROL_HOST = "127.0.0.1";
 const TOR_CONTROL_PORT_FILE = join(TOR_DATA_DIR, "control.port");
@@ -48,7 +76,9 @@ const TOR_LOG_FILE = join(TOR_DATA_DIR, "tor.log");
 const MAX_TOR_LOG_BYTES = 10 * 1024 * 1024;
 const TOR_COUNTRY_FILE = join(TOR_DATA_DIR, "country");
 const TOR_COUNTRY_CODES = new Set(
-  "ad ae af ag ai al am an ao ap aq ar as at au aw ax az ba bb bd be bf bg bh bi bj bl bm bn bo bq br bs bt bv bw by bz ca cc cd cf cg ch ci ck cl cm cn co cr cs cu cv cw cx cy cz de dj dk dm do dz ec ee eg eh er es et eu fi fj fk fm fo fr ga gb gd ge gf gg gh gi gl gm gn gp gq gr gs gt gu gw gy hk hn hr ht hu id ie il im in io iq ir is it je jm jo jp ke kg kh ki km kn kp kr kw ky kz la lb lc li lk lr ls lt lu lv ly ma mc md me mf mg mh mk ml mm mn mo mp mq mr ms mt mu mv mw mx my mz na nc ne nf ng ni nl no np nr nu nz om pa pe pf pg ph pk pl pm pn pr ps pt pw py qa re ro rs ru rw sa sb sc sd se sg sh si sj sk sl sm sn so sr ss st sv sx sy sz tc td tf tg th tj tk tl tm tn to tr tt tv tw tz ua ug uk um us uy uz va vc ve vg vi vn vu wf ws ye yt za zm zw".split(" ")
+  "ad ae af ag ai al am an ao ap aq ar as at au aw ax az ba bb bd be bf bg bh bi bj bl bm bn bo bq br bs bt bv bw by bz ca cc cd cf cg ch ci ck cl cm cn co cr cs cu cv cw cx cy cz de dj dk dm do dz ec ee eg eh er es et eu fi fj fk fm fo fr ga gb gd ge gf gg gh gi gl gm gn gp gq gr gs gt gu gw gy hk hn hr ht hu id ie il im in io iq ir is it je jm jo jp ke kg kh ki km kn kp kr kw ky kz la lb lc li lk lr ls lt lu lv ly ma mc md me mf mg mh mk ml mm mn mo mp mq mr ms mt mu mv mw mx my mz na nc ne nf ng ni nl no np nr nu nz om pa pe pf pg ph pk pl pm pn pr ps pt pw py qa re ro rs ru rw sa sb sc sd se sg sh si sj sk sl sm sn so sr ss st sv sx sy sz tc td tf tg th tj tk tl tm tn to tr tt tv tw tz ua ug uk um us uy uz va vc ve vg vi vn vu wf ws ye yt za zm zw".split(
+    " ",
+  ),
 );
 
 const countryNameOverrides: Record<string, string> = {
@@ -69,12 +99,15 @@ function countryName(cc: string): string {
 function countryLabel(cc: string): string {
   return `{${cc}} (${countryName(cc)})`;
 }
-function countryCompletions(prefix: string): { value: string; label: string }[] | null {
+function countryCompletions(
+  prefix: string,
+): { value: string; label: string }[] | null {
   const query = prefix.trim().toLowerCase();
   const items = [...TOR_COUNTRY_CODES]
     .filter((cc) => cc.startsWith(query))
     .map((cc) => ({ value: cc, label: `${cc} — ${countryName(cc)}` }));
-  if ("off".startsWith(query)) items.push({ value: "off", label: "off — clear the setting" });
+  if ("off".startsWith(query))
+    items.push({ value: "off", label: "off — clear the setting" });
   return items.length > 0 ? items : null;
 }
 
@@ -87,7 +120,11 @@ const PROXY_ENV_VARS = [
 const DNS_PROXY_ENV_VARS = ["ALL_PROXY", "all_proxy"] as const;
 const NO_PROXY_VALUE = "127.0.0.1,localhost,::1";
 const NO_PROXY_ENV_VARS = ["NO_PROXY", "no_proxy"] as const;
-const ALL_PROXY_ENV_VARS = [...PROXY_ENV_VARS, ...DNS_PROXY_ENV_VARS, ...NO_PROXY_ENV_VARS] as const;
+const ALL_PROXY_ENV_VARS = [
+  ...PROXY_ENV_VARS,
+  ...DNS_PROXY_ENV_VARS,
+  ...NO_PROXY_ENV_VARS,
+] as const;
 
 const savedProxyEnv = new Map<string, string | undefined>();
 
@@ -112,18 +149,37 @@ export default function (pi: ExtensionAPI) {
   let stopRequested = false;
   const MAX_RESTART_ATTEMPTS = 3;
   let startPromise: Promise<string | null> | null = null;
+  const persistedPortInit = readPersistedPort();
+  if (persistedPortInit !== null) {
+    TOR_SOCKS_PORT = persistedPortInit;
+    refreshProxyStrings();
+  }
+  let dispatcherModule: { configureHttpDispatcher?: () => void } | null = null;
+  let dispatcherResolved = false;
+  let undiciModCache: unknown = null;
+  let undiciModAttempted = false;
+  async function getUndici(): Promise<unknown> {
+    if (undiciModCache) return undiciModCache;
+    if (undiciModAttempted) return null;
+    undiciModAttempted = true;
+    try {
+      undiciModCache = await import("undici");
+    } catch {}
+    return undiciModCache;
+  }
   function setProxyVar(v: string, value: string): void {
     if (!savedProxyEnv.has(v)) savedProxyEnv.set(v, process.env[v]);
     process.env[v] = value;
   }
 
-  function setProxyEnv(): void {
+  async function setProxyEnv(): Promise<void> {
     for (const v of PROXY_ENV_VARS) setProxyVar(v, TOR_SOCKS_PROXY);
     for (const v of DNS_PROXY_ENV_VARS) setProxyVar(v, TOR_SOCKS_PROXY_DNS);
     for (const v of NO_PROXY_ENV_VARS) setProxyVar(v, NO_PROXY_VALUE);
+    await syncDispatcher();
   }
 
-  function clearProxyEnv(): void {
+  async function clearProxyEnv(): Promise<void> {
     for (const v of ALL_PROXY_ENV_VARS) {
       if (!savedProxyEnv.has(v)) continue;
       const original = savedProxyEnv.get(v);
@@ -134,6 +190,7 @@ export default function (pi: ExtensionAPI) {
       }
       savedProxyEnv.delete(v);
     }
+    await syncDispatcher();
   }
 
   function writeFileBestEffort(path: string, content: string): boolean {
@@ -178,7 +235,10 @@ export default function (pi: ExtensionAPI) {
   let startingMarkerWritten = false;
 
   function writeStartingMarker(): void {
-    startingMarkerWritten = writeFileBestEffort(TOR_STARTING_FILE, String(Date.now()));
+    startingMarkerWritten = writeFileBestEffort(
+      TOR_STARTING_FILE,
+      String(Date.now()),
+    );
   }
 
   function clearStartingMarker(): void {
@@ -195,8 +255,10 @@ export default function (pi: ExtensionAPI) {
   }
 
   function envIsSet(): boolean {
-    for (const v of PROXY_ENV_VARS) if (process.env[v] === TOR_SOCKS_PROXY) return true;
-    for (const v of DNS_PROXY_ENV_VARS) if (process.env[v] === TOR_SOCKS_PROXY_DNS) return true;
+    for (const v of PROXY_ENV_VARS)
+      if (process.env[v] === TOR_SOCKS_PROXY) return true;
+    for (const v of DNS_PROXY_ENV_VARS)
+      if (process.env[v] === TOR_SOCKS_PROXY_DNS) return true;
     return false;
   }
 
@@ -211,8 +273,12 @@ export default function (pi: ExtensionAPI) {
     try {
       const parsed = JSON.parse(raw) as Partial<CountryConfig>;
       return {
-        exitNodes: typeof parsed.exitNodes === "string" ? parsed.exitNodes : null,
-        excludeExitNodes: typeof parsed.excludeExitNodes === "string" ? parsed.excludeExitNodes : null,
+        exitNodes:
+          typeof parsed.exitNodes === "string" ? parsed.exitNodes : null,
+        excludeExitNodes:
+          typeof parsed.excludeExitNodes === "string"
+            ? parsed.excludeExitNodes
+            : null,
       };
     } catch {
       return { exitNodes: null, excludeExitNodes: null };
@@ -225,8 +291,10 @@ export default function (pi: ExtensionAPI) {
 
   function countrySpawnArgs(config: CountryConfig): string[] {
     const args: string[] = [];
-    if (config.exitNodes) args.push("--ExitNodes", `{${config.exitNodes}}`, "--StrictNodes", "1");
-    if (config.excludeExitNodes) args.push("--ExcludeExitNodes", `{${config.excludeExitNodes}}`);
+    if (config.exitNodes)
+      args.push("--ExitNodes", `{${config.exitNodes}}`, "--StrictNodes", "1");
+    if (config.excludeExitNodes)
+      args.push("--ExcludeExitNodes", `{${config.excludeExitNodes}}`);
     return args;
   }
 
@@ -234,7 +302,8 @@ export default function (pi: ExtensionAPI) {
     const country = readCountryConfig();
     const parts: string[] = [];
     if (country.exitNodes) parts.push(`exit {${country.exitNodes}}`);
-    if (country.excludeExitNodes) parts.push(`exclude {${country.excludeExitNodes}}`);
+    if (country.excludeExitNodes)
+      parts.push(`exclude {${country.excludeExitNodes}}`);
     return parts.length > 0 ? `\nCountries: ${parts.join(", ")}` : "";
   }
 
@@ -246,8 +315,16 @@ export default function (pi: ExtensionAPI) {
 
   function readLeaseFile(name: string): InstanceLease | null {
     try {
-      const lease = JSON.parse(readFileSync(join(LEASE_DIR, name), "utf8")) as InstanceLease;
-      if (lease && typeof lease.pid === "number" && typeof lease.envSet === "boolean" && typeof lease.updatedAt === "number") return lease;
+      const lease = JSON.parse(
+        readFileSync(join(LEASE_DIR, name), "utf8"),
+      ) as InstanceLease;
+      if (
+        lease &&
+        typeof lease.pid === "number" &&
+        typeof lease.envSet === "boolean" &&
+        typeof lease.updatedAt === "number"
+      )
+        return lease;
     } catch {}
     return null;
   }
@@ -259,15 +336,24 @@ export default function (pi: ExtensionAPI) {
       for (const file of readdirSync(LEASE_DIR)) {
         if (!file.endsWith(".json") || file === `${process.pid}.json`) continue;
         try {
-          const raw = JSON.parse(readFileSync(join(LEASE_DIR, file), "utf8")) as { updatedAt?: unknown };
-          if (typeof raw?.updatedAt === "number" && now - raw.updatedAt >= LEASE_TTL_MS) {
+          const raw = JSON.parse(
+            readFileSync(join(LEASE_DIR, file), "utf8"),
+          ) as { updatedAt?: unknown };
+          if (
+            typeof raw?.updatedAt === "number" &&
+            now - raw.updatedAt >= LEASE_TTL_MS
+          ) {
             removeBestEffort(join(LEASE_DIR, file));
           }
         } catch {}
       }
       writeFileSync(
         join(LEASE_DIR, `${process.pid}.json`),
-        JSON.stringify({ pid: process.pid, envSet: envIsSet(), updatedAt: now })
+        JSON.stringify({
+          pid: process.pid,
+          envSet: envIsSet(),
+          updatedAt: now,
+        }),
       );
     } catch {}
   }
@@ -286,7 +372,9 @@ export default function (pi: ExtensionAPI) {
 
   function anyLiveInstanceNeedsTor(): boolean {
     const now = Date.now();
-    return readLeases().some((l) => l.envSet && now - l.updatedAt < LEASE_TTL_MS);
+    return readLeases().some(
+      (l) => l.envSet && now - l.updatedAt < LEASE_TTL_MS,
+    );
   }
 
   async function maybeKillTor(): Promise<void> {
@@ -305,10 +393,10 @@ export default function (pi: ExtensionAPI) {
     state.enabled = enabled;
     const startFailure = enabled ? await ensureTorRunning() : null;
     if (enabled && startFailure === null) {
-      if (!envIsSet()) setProxyEnv();
+      if (!envIsSet()) await setProxyEnv();
       startFailureReported = false;
     } else if (!enabled && envIsSet()) {
-      clearProxyEnv();
+      await clearProxyEnv();
     } else if (startFailure !== null && !startFailureReported) {
       state.enabled = false;
       startFailureReported = true;
@@ -385,22 +473,118 @@ export default function (pi: ExtensionAPI) {
     return applyNow ? "" : "\nApplies from next turn.";
   }
 
-  async function probeTorOnce(): Promise<boolean> {
+  async function probeTorOnce(port: number = TOR_SOCKS_PORT): Promise<boolean> {
     return new Promise<boolean>((resolve) => {
       const socket = new net.Socket();
       socket.setTimeout(1500);
-      socket.on("connect", () => { socket.destroy(); resolve(true); });
-      socket.on("timeout", () => { socket.destroy(); resolve(false); });
-      socket.on("error", () => { socket.destroy(); resolve(false); });
-      socket.connect(TOR_SOCKS_PORT, TOR_SOCKS_HOST);
+      socket.on("connect", () => {
+        socket.destroy();
+        resolve(true);
+      });
+      socket.on("timeout", () => {
+        socket.destroy();
+        resolve(false);
+      });
+      socket.on("error", () => {
+        socket.destroy();
+        resolve(false);
+      });
+      socket.connect(port, TOR_SOCKS_HOST);
     });
   }
-  async function isTorListening(): Promise<boolean> {
+  async function isTorListeningOn(port: number): Promise<boolean> {
     for (let attempt = 0; attempt < 3; attempt++) {
-      if (await probeTorOnce()) return true;
+      if (await probeTorOnce(port)) return true;
       if (attempt < 2) await sleep(250);
     }
     return false;
+  }
+  async function isTorListening(): Promise<boolean> {
+    return isTorListeningOn(TOR_SOCKS_PORT);
+  }
+  function readPersistedPort(): number | null {
+    const raw = readFileSafe(TOR_SOCKS_PORT_FILE);
+    if (!raw) return null;
+    const n = Number(raw.trim());
+    return Number.isInteger(n) && n > 0 && n <= 65535 ? n : null;
+  }
+  function writePersistedPort(port: number): void {
+    writeFileBestEffort(TOR_SOCKS_PORT_FILE, String(port));
+  }
+  async function findPort(wantListening: boolean): Promise<number | null> {
+    for (let p = 9050; p <= 9060; p++)
+      if ((await isTorListeningOn(p)) === wantListening) return p;
+    return null;
+  }
+  async function findListeningPort(): Promise<number | null> {
+    return findPort(true);
+  }
+  async function findFreePort(): Promise<number | null> {
+    return findPort(false);
+  }
+  async function resolveSocksPort(): Promise<number> {
+    const persisted = readPersistedPort();
+    if (persisted !== null && (await isTorListeningOn(persisted))) {
+      TOR_SOCKS_PORT = persisted;
+      refreshProxyStrings();
+      return persisted;
+    }
+    const listening = await findListeningPort();
+    if (listening !== null) {
+      TOR_SOCKS_PORT = listening;
+      refreshProxyStrings();
+      writePersistedPort(listening);
+      return listening;
+    }
+    const free = await findFreePort();
+    if (free !== null) {
+      TOR_SOCKS_PORT = free;
+      refreshProxyStrings();
+      writePersistedPort(free);
+      return free;
+    }
+    TOR_SOCKS_PORT = 9050;
+    refreshProxyStrings();
+    return 9050;
+  }
+  async function syncDispatcher(): Promise<void> {
+    if (!dispatcherResolved) {
+      dispatcherResolved = true;
+      try {
+        const require = createRequire(import.meta.url);
+        const piPkg =
+          require.resolve("@earendil-works/pi-coding-agent/package.json");
+        const piDir = dirname(piPkg);
+        const dispatcherPath = join(piDir, "dist/core/http-dispatcher.js");
+        const mod = (await import(pathToFileURL(dispatcherPath).href)) as {
+          configureHttpDispatcher?: () => void;
+        };
+        dispatcherModule = mod;
+      } catch {}
+    }
+    if (dispatcherModule?.configureHttpDispatcher) {
+      try {
+        dispatcherModule.configureHttpDispatcher();
+        return;
+      } catch {}
+    }
+    const undiciMod = (await getUndici()) as
+      | {
+          EnvHttpProxyAgent?: new () => unknown;
+          setGlobalDispatcher?: (d: unknown) => void;
+          install?: () => void;
+        }
+      | null;
+    if (undiciMod?.EnvHttpProxyAgent && undiciMod?.setGlobalDispatcher) {
+      try {
+        const dispatcher = new undiciMod.EnvHttpProxyAgent();
+        undiciMod.setGlobalDispatcher(dispatcher);
+        try {
+          const maybeInstall = undiciMod.install;
+          if (typeof maybeInstall === "function") maybeInstall();
+        } catch {}
+      } catch {}
+    }
   }
   function torDownloadUrlsFor(file: string, version: string): string[] {
     return [
@@ -452,7 +636,10 @@ export default function (pi: ExtensionAPI) {
   async function downloadTor(notify: Notify): Promise<string | null> {
     const urls = getTorDownloadUrls();
     if (urls.length === 0) {
-      notify(`Unsupported platform: ${process.platform}/${process.arch}`, "error");
+      notify(
+        `Unsupported platform: ${process.platform}/${process.arch}`,
+        "error",
+      );
       return null;
     }
     notify("Downloading Tor... (first time only, ~30MB)", "info");
@@ -462,7 +649,10 @@ export default function (pi: ExtensionAPI) {
     try {
       mkdirSync(TOR_DIR, { recursive: true });
     } catch (err) {
-      notify(`Download failed: ${err instanceof Error ? err.message : String(err)}`, "error");
+      notify(
+        `Download failed: ${err instanceof Error ? err.message : String(err)}`,
+        "error",
+      );
       return null;
     }
     for (const url of urls) {
@@ -475,16 +665,22 @@ export default function (pi: ExtensionAPI) {
           } catch {}
           const headers: Record<string, string> = {};
           if (existingSize > 0) headers["Range"] = `bytes=${existingSize}-`;
-          const response = await fetch(url, { headers, signal: AbortSignal.timeout(120_000) });
+          const response = await fetch(url, {
+            headers,
+            signal: AbortSignal.timeout(120_000),
+          });
           if (existingSize > 0 && response.status === 416) {
             removeBestEffort(tarPath);
             throw new Error("HTTP 416: Range not satisfiable");
           }
           const isResume = response.status === 206 && existingSize > 0;
-          if (!isResume && !response.ok) throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+          if (!isResume && !response.ok)
+            throw new Error(`HTTP ${response.status}: ${response.statusText}`);
           if (!response.body) throw new Error("Empty response body");
-          const fileStream = createWriteStream(tarPath, { flags: isResume ? "a" : "w" });
-          await pipeline(Readable.fromWeb(response.body as any), fileStream);
+          const fileStream = createWriteStream(tarPath, {
+            flags: isResume ? "a" : "w",
+          });
+          await pipeline(Readable.fromWeb(response.body as never), fileStream);
           const fileName = url.split("/").pop() ?? "";
           const expectedSha = TOR_BUNDLE_SHA256[fileName];
           if (!expectedSha) {
@@ -494,7 +690,9 @@ export default function (pi: ExtensionAPI) {
           const actualSha = await sha256File(tarPath);
           if (actualSha !== expectedSha) {
             removeBestEffort(tarPath);
-            throw new Error(`Checksum mismatch for ${fileName}: expected ${expectedSha}, got ${actualSha}`);
+            throw new Error(
+              `Checksum mismatch for ${fileName}: expected ${expectedSha}, got ${actualSha}`,
+            );
           }
           downloadedUrl = url;
           success = true;
@@ -509,26 +707,35 @@ export default function (pi: ExtensionAPI) {
       removeBestEffort(tarPath);
     }
     if (!downloadedUrl) {
-      notify(`Download failed: ${lastError instanceof Error ? lastError.message : String(lastError)}`, "error");
+      notify(
+        `Download failed: ${lastError instanceof Error ? lastError.message : String(lastError)}`,
+        "error",
+      );
       removeBestEffort(tarPath);
       return null;
     }
     notify("Extracting Tor...", "info");
     try {
       await new Promise<void>((resolve, reject) => {
-        const child = spawn("tar", ["-xzf", tarPath, "-C", TOR_DIR], { stdio: ["ignore", "ignore", "pipe"] });
+        const child = spawn("tar", ["-xzf", tarPath, "-C", TOR_DIR], {
+          stdio: ["ignore", "ignore", "pipe"],
+        });
         let stderr = "";
         child.stderr?.on("data", (d: Buffer) => {
           stderr += d.toString();
         });
         child.on("close", (code) => {
           if (code === 0) resolve();
-          else reject(new Error(`tar exited with code ${code}: ${stderr.trim()}`));
+          else
+            reject(new Error(`tar exited with code ${code}: ${stderr.trim()}`));
         });
         child.on("error", reject);
       });
     } catch (err) {
-      notify(`Download failed: ${err instanceof Error ? err.message : String(err)}`, "error");
+      notify(
+        `Download failed: ${err instanceof Error ? err.message : String(err)}`,
+        "error",
+      );
       removeBestEffort(tarPath);
       return null;
     }
@@ -560,13 +767,18 @@ export default function (pi: ExtensionAPI) {
   function isTorProcess(pid: number): boolean {
     if (process.platform === "linux") {
       try {
-        return readFileSync(`/proc/${pid}/comm`, "utf8").trim().toLowerCase() === "tor";
+        return (
+          readFileSync(`/proc/${pid}/comm`, "utf8").trim().toLowerCase() ===
+          "tor"
+        );
       } catch {
         return false;
       }
     }
     try {
-      const out = execFileSync("ps", ["-p", String(pid), "-o", "comm="], { encoding: "utf8" });
+      const out = execFileSync("ps", ["-p", String(pid), "-o", "comm="], {
+        encoding: "utf8",
+      });
       return out.trim().toLowerCase() === "tor";
     } catch {
       return false;
@@ -575,7 +787,9 @@ export default function (pi: ExtensionAPI) {
 
   function readTorPid(): number | null {
     try {
-      const pid = Number(readFileSync(join(TOR_DATA_DIR, "tor.pid"), "utf8").trim());
+      const pid = Number(
+        readFileSync(join(TOR_DATA_DIR, "tor.pid"), "utf8").trim(),
+      );
       if (!Number.isInteger(pid) || pid <= 0) return null;
       return isTorProcess(pid) ? pid : null;
     } catch {
@@ -594,7 +808,12 @@ export default function (pi: ExtensionAPI) {
   }
 
   function clearDescriptorCache(): void {
-    for (const name of ["cached-microdescs.new", "cached-microdescs", "cached-microdesc-consensus", "cached-certs"])
+    for (const name of [
+      "cached-microdescs.new",
+      "cached-microdescs",
+      "cached-microdesc-consensus",
+      "cached-certs",
+    ])
       removeBestEffort(join(TOR_DATA_DIR, name));
   }
 
@@ -608,35 +827,53 @@ export default function (pi: ExtensionAPI) {
         prepareTorStart();
         const torDir = dirname(torBin);
 
-        child = spawn(torBin, [
-          "--SocksPort", `${TOR_SOCKS_HOST}:${TOR_SOCKS_PORT}`,
-          "--ControlPort", "auto",
-          "--ControlPortWriteToFile", TOR_CONTROL_PORT_FILE,
-          "--CookieAuthentication", "1",
-          "--DataDirectory", TOR_DATA_DIR,
-          "--GeoIPFile", join(TOR_DATA_DIR, "geoip"),
-          "--GeoIPv6File", join(TOR_DATA_DIR, "geoip6"),
-          "--PidFile", join(TOR_DATA_DIR, "tor.pid"),
-          "--Log", "notice stdout",
-          "--Log", `notice file ${TOR_LOG_FILE}`,
-          "--DisableDebuggerAttachment", "1",
-          ...countrySpawnArgs(readCountryConfig()),
-        ], {
-          stdio: ["ignore", "pipe", "pipe"],
-          env: {
-            ...process.env,
-            LD_LIBRARY_PATH: process.env.LD_LIBRARY_PATH
-              ? `${process.env.LD_LIBRARY_PATH}:${torDir}`
-              : torDir,
+        child = spawn(
+          torBin,
+          [
+            "--SocksPort",
+            `${TOR_SOCKS_HOST}:${TOR_SOCKS_PORT}`,
+            "--ControlPort",
+            "auto",
+            "--ControlPortWriteToFile",
+            TOR_CONTROL_PORT_FILE,
+            "--CookieAuthentication",
+            "1",
+            "--DataDirectory",
+            TOR_DATA_DIR,
+            "--GeoIPFile",
+            join(TOR_DATA_DIR, "geoip"),
+            "--GeoIPv6File",
+            join(TOR_DATA_DIR, "geoip6"),
+            "--PidFile",
+            join(TOR_DATA_DIR, "tor.pid"),
+            "--Log",
+            "notice stdout",
+            "--Log",
+            `notice file ${TOR_LOG_FILE}`,
+            "--DisableDebuggerAttachment",
+            "1",
+            ...countrySpawnArgs(readCountryConfig()),
+          ],
+          {
+            stdio: ["ignore", "pipe", "pipe"],
+            env: {
+              ...process.env,
+              LD_LIBRARY_PATH: process.env.LD_LIBRARY_PATH
+                ? `${process.env.LD_LIBRARY_PATH}:${torDir}`
+                : torDir,
+            },
           },
-        });
+        );
       } catch (err) {
-        resolve(`Failed to start Tor: ${err instanceof Error ? err.message : String(err)}`);
+        resolve(
+          `Failed to start Tor: ${err instanceof Error ? err.message : String(err)}`,
+        );
         return;
       }
 
       let resolved = false;
       let stdoutBuffer = "";
+      let stderrBuffer = "";
       let sawProgress = false;
       const startedAt = Date.now();
       const terminateAndResolve = (message: string): void => {
@@ -685,6 +922,7 @@ export default function (pi: ExtensionAPI) {
 
       child.stderr?.on("data", (data: Buffer) => {
         const text = data.toString();
+        stderrBuffer += text;
         if (text.includes("[err]")) {
           console.error("Tor error:", text);
         }
@@ -694,7 +932,9 @@ export default function (pi: ExtensionAPI) {
         if (!resolved) {
           resolved = true;
           clearInterval(watchdog);
-          resolve(`Tor exited with code ${code}`);
+          const detail = stderrBuffer.trim().split("\n").pop()?.trim();
+          const suffix = detail ? `: ${detail}` : "";
+          resolve(`Tor exited with code ${code}${suffix}`);
         }
         if (state.torProcess === child) state.torProcess = null;
         if (state.torPid === child.pid) state.torPid = null;
@@ -718,7 +958,25 @@ export default function (pi: ExtensionAPI) {
     const failure = await startTor(torBin);
     if (!failure) return null;
     if (await isTorListening()) return null;
-    statusUi?.notify("Tor startup failed; clearing stale cache and retrying...", "warning");
+    const portConflict =
+      failure.includes("Address already in use") ||
+      failure.includes("EADDRINUSE") ||
+      failure.includes("Could not bind");
+    if (portConflict) {
+      const free = await findFreePort();
+      if (free !== null) {
+        TOR_SOCKS_PORT = free;
+        refreshProxyStrings();
+        writePersistedPort(free);
+      }
+      const retryPort = await startTor(torBin);
+      if (!retryPort) return null;
+      return (await isTorListening()) ? null : retryPort;
+    }
+    statusUi?.notify(
+      "Tor startup failed; clearing stale cache and retrying...",
+      "warning",
+    );
     clearDescriptorCache();
     const retry = await startTor(torBin);
     if (!retry) return null;
@@ -731,6 +989,7 @@ export default function (pi: ExtensionAPI) {
   }
 
   async function ensureTorRunning(): Promise<string | null> {
+    await resolveSocksPort();
     if (await isTorListening()) return null;
     if (startingInProgress()) return null;
     const torBin = findTorBinary();
@@ -751,46 +1010,97 @@ export default function (pi: ExtensionAPI) {
     if (child) {
       child.kill("SIGTERM");
     } else if (pid) {
-      try { process.kill(pid, "SIGTERM"); } catch {}
+      try {
+        process.kill(pid, "SIGTERM");
+      } catch {}
     } else {
       return;
     }
 
     for (let i = 0; i < 20; i++) {
       await sleep(250);
-      const exited = child ? child.exitCode !== null : !(await isTorListening());
+      const exited = child
+        ? child.exitCode !== null
+        : !(await isTorListening());
       if (exited) break;
     }
 
     if (child) {
       child.kill("SIGKILL");
     } else if (pid) {
-      try { process.kill(pid, "SIGKILL"); } catch {}
+      try {
+        process.kill(pid, "SIGKILL");
+      } catch {}
     }
     removePartialDescriptorCache();
   }
 
+  async function fetchViaTor(url: string): Promise<string | null> {
+    const undiciMod = (await getUndici()) as
+      | {
+          ProxyAgent?: new (s: string) => unknown;
+          fetch?: (
+            url: string,
+            opts: unknown,
+          ) => Promise<{ ok: boolean; text: () => Promise<string> }>;
+        }
+      | null;
+    if (
+      !undiciMod ||
+      typeof (undiciMod as { ProxyAgent?: unknown }).ProxyAgent !== "function" ||
+      typeof (undiciMod as { fetch?: unknown }).fetch !== "function"
+    )
+      return null;
+    try {
+      const ProxyAgent = (undiciMod as { ProxyAgent: new (s: string) => unknown })
+        .ProxyAgent;
+      const undiciFetch = (
+        undiciMod as {
+          fetch: (
+            url: string,
+            opts: unknown,
+          ) => Promise<{ ok: boolean; text: () => Promise<string> }>;
+        }
+      ).fetch;
+      const dispatcher = new ProxyAgent(TOR_SOCKS_PROXY_DNS);
+      const res = await undiciFetch(url, {
+        dispatcher,
+        signal: AbortSignal.timeout(15000),
+      } as unknown);
+      if (!res.ok) return null;
+      const txt = await res.text();
+      return txt.trim() || null;
+    } catch {
+      return null;
+    }
+  }
   let curlMissingReported = false;
-
   function reportCurlMissing(): void {
     if (curlMissingReported) return;
     curlMissingReported = true;
     console.error("curl not found: Tor exit IP verification unavailable");
     statusUi?.notify("curl not found — cannot verify Tor exit IP", "error");
   }
-
-  function curlThroughTor(url: string): Promise<string | null> {
+  async function curlThroughTor(url: string): Promise<string | null> {
+    const fetched = await fetchViaTor(url);
+    if (fetched !== null) return fetched;
     return new Promise((resolve) => {
       const child = spawn("curl", [
-        "-s", "--max-time", "15",
-        "--proxy", TOR_SOCKS_PROXY_DNS,
+        "-s",
+        "--max-time",
+        "15",
+        "--proxy",
+        TOR_SOCKS_PROXY_DNS,
         url,
       ]);
       let output = "";
-      child.stdout.on("data", (d: Buffer) => { output += d.toString(); });
+      child.stdout.on("data", (d: Buffer) => {
+        output += d.toString();
+      });
       child.on("close", () => resolve(output.trim() || null));
       child.on("error", (err) => {
-        if ((err as NodeJS.ErrnoException).code === "ENOENT") reportCurlMissing();
+        if ((err as NodeJS.ErrnoException).code === "ENOENT")
+          reportCurlMissing();
         resolve(null);
       });
     });
@@ -812,10 +1122,15 @@ export default function (pi: ExtensionAPI) {
       return parsed.IP;
     }
     if (parsed.IsTor === false) {
-      console.error("Traffic is not exiting through Tor: check.torproject.org reports IsTor=false");
+      console.error(
+        "Traffic is not exiting through Tor: check.torproject.org reports IsTor=false",
+      );
       if (!leakReported) {
         leakReported = true;
-        statusUi?.notify("Traffic is not exiting through Tor — check your proxy configuration", "error");
+        statusUi?.notify(
+          "Traffic is not exiting through Tor — check your proxy configuration",
+          "error",
+        );
       }
     }
     return null;
@@ -851,7 +1166,9 @@ export default function (pi: ExtensionAPI) {
     waitMs: number;
   }
 
-  async function controlRequest(commands: string[]): Promise<ControlResponse[]> {
+  async function controlRequest(
+    commands: string[],
+  ): Promise<ControlResponse[]> {
     const port = readControlPort();
     if (!port) return [];
     const cookie = readControlCookie();
@@ -933,11 +1250,18 @@ export default function (pi: ExtensionAPI) {
     const signal = responses[0];
     if (!signal) return { status: "failed", waitMs: 0 };
     if (signal.code === 250) return { status: "ok", waitMs: 0 };
-    if (signal.code === 551) return { status: "rate-limited", waitMs: parseNewnymWaitMs(signal.message) };
+    if (signal.code === 551)
+      return {
+        status: "rate-limited",
+        waitMs: parseNewnymWaitMs(signal.message),
+      };
     return { status: "failed", waitMs: 0 };
   }
 
-  function controlSucceeded(responses: ControlResponse[], commandCount: number): boolean {
+  function controlSucceeded(
+    responses: ControlResponse[],
+    commandCount: number,
+  ): boolean {
     if (responses.length < commandCount) return false;
     return responses.slice(0, commandCount).every((r) => r.code === 250);
   }
@@ -945,7 +1269,10 @@ export default function (pi: ExtensionAPI) {
   async function applyCountryConfig(config: CountryConfig): Promise<boolean> {
     const commands: string[] = [];
     if (config.exitNodes) {
-      commands.push(`SETCONF ExitNodes={${config.exitNodes}}`, "SETCONF StrictNodes=1");
+      commands.push(
+        `SETCONF ExitNodes={${config.exitNodes}}`,
+        "SETCONF StrictNodes=1",
+      );
     } else {
       commands.push("SETCONF ExitNodes=", "SETCONF StrictNodes=0");
     }
@@ -957,7 +1284,10 @@ export default function (pi: ExtensionAPI) {
     return controlSucceeded(await controlRequest(commands), commands.length);
   }
 
-  async function waitForNewIp(oldIp: string | null, timeoutMs: number): Promise<string | null> {
+  async function waitForNewIp(
+    oldIp: string | null,
+    timeoutMs: number,
+  ): Promise<string | null> {
     const deadline = Date.now() + timeoutMs;
     let lastIp: string | null = null;
     while (Date.now() < deadline) {
@@ -1001,6 +1331,7 @@ export default function (pi: ExtensionAPI) {
 
   async function enableTor(ctx: ExtensionCommandContext): Promise<void> {
     stopRequested = false;
+    await resolveSocksPort();
     const listening = await isTorListening();
     if (!listening) {
       writeStartingMarker();
@@ -1035,7 +1366,7 @@ export default function (pi: ExtensionAPI) {
     state.enabled = true;
     persistEnabled(true);
     clearStartingMarker();
-    if (ctx.isIdle() && !envIsSet()) setProxyEnv();
+    if (ctx.isIdle() && !envIsSet()) await setProxyEnv();
     writeLease();
 
     const ip = await getTorIp();
@@ -1050,12 +1381,15 @@ export default function (pi: ExtensionAPI) {
     ctx.ui.notify(`Tor enabled.${ipMsg}${pending}`, "info");
   }
 
-  async function disableTor(ctx: ExtensionContext, silent = false): Promise<void> {
+  async function disableTor(
+    ctx: ExtensionContext,
+    silent = false,
+  ): Promise<void> {
     clearStartingMarker();
     state.enabled = false;
     state.currentIp = null;
     persistEnabled(false);
-    if (ctx.isIdle() && envIsSet()) clearProxyEnv();
+    if (ctx.isIdle() && envIsSet()) await clearProxyEnv();
     writeLease();
     await maybeKillTor();
     ipPolling.stop();
@@ -1099,7 +1433,10 @@ export default function (pi: ExtensionAPI) {
       const pending = pendingNote(ctx.isIdle() || envIsSet());
       const ipStr = ip ? `\nIP: ${ip}` : "\nIP: unknown";
       const countryStr = countrySummary();
-      ctx.ui.notify(`Tor: ENABLED\nProxy: ${TOR_SOCKS_PROXY}${ipStr}${countryStr}${pending}`, "info");
+      ctx.ui.notify(
+        `Tor: ENABLED\nProxy: ${TOR_SOCKS_PROXY}${ipStr}${countryStr}${pending}`,
+        "info",
+      );
       updateStatus(ctx.ui);
     },
   });
@@ -1113,7 +1450,10 @@ export default function (pi: ExtensionAPI) {
       success = await renewTorCircuit();
       if (await handleStopRequested(ctx)) return;
       if (!success) break;
-      newIp = await waitForNewIp(oldIp, attempt === 1 ? CYCLE_FIRST_WAIT_MS : CYCLE_RETRY_WAIT_MS);
+      newIp = await waitForNewIp(
+        oldIp,
+        attempt === 1 ? CYCLE_FIRST_WAIT_MS : CYCLE_RETRY_WAIT_MS,
+      );
       if (!state.enabled) return;
       if (newIp && newIp !== oldIp) break;
       if (attempt < MAX_CYCLE_ATTEMPTS) await sleep(CYCLE_RETRY_DELAY_MS);
@@ -1126,7 +1466,10 @@ export default function (pi: ExtensionAPI) {
     } else if (newIp && newIp !== oldIp) {
       ctx.ui.notify(`New IP: ${newIp} (was: ${oldIp || "unknown"})`, "info");
     } else if (newIp) {
-      ctx.ui.notify(`IP: ${newIp} (same as before, may need more time)`, "info");
+      ctx.ui.notify(
+        `IP: ${newIp} (same as before, may need more time)`,
+        "info",
+      );
     } else {
       ctx.ui.notify("Circuit cycled, but failed to get new IP", "info");
     }
@@ -1143,10 +1486,13 @@ export default function (pi: ExtensionAPI) {
 
   function parseCountryArg(args: string): ParsedCountryArg {
     const value = args.trim().toLowerCase();
-    if (value === "") return { missing: true, invalid: null, clear: false, cc: null };
-    if (value === "off") return { missing: false, invalid: null, clear: true, cc: null };
+    if (value === "")
+      return { missing: true, invalid: null, clear: false, cc: null };
+    if (value === "off")
+      return { missing: false, invalid: null, clear: true, cc: null };
     if (/^[a-z]{2}$/.test(value)) {
-      if (TOR_COUNTRY_CODES.has(value)) return { missing: false, invalid: null, clear: false, cc: value };
+      if (TOR_COUNTRY_CODES.has(value))
+        return { missing: false, invalid: null, clear: false, cc: value };
       return { missing: false, invalid: value, clear: false, cc: null };
     }
     return { missing: false, invalid: value, clear: false, cc: null };
@@ -1156,7 +1502,7 @@ export default function (pi: ExtensionAPI) {
     ctx: ExtensionCommandContext,
     field: "exitNodes" | "excludeExitNodes",
     label: string,
-    args: string
+    args: string,
   ): Promise<void> {
     const parsed = parseCountryArg(args);
     const config = readCountryConfig();
@@ -1165,11 +1511,17 @@ export default function (pi: ExtensionAPI) {
 
     if (parsed.missing) {
       const current = config[field];
-      ctx.ui.notify(`Usage: /tor-${label} <cc|off>\nCurrent: ${current ? `{${current}}` : "none"}`, "info");
+      ctx.ui.notify(
+        `Usage: /tor-${label} <cc|off>\nCurrent: ${current ? `{${current}}` : "none"}`,
+        "info",
+      );
       return;
     }
     if (parsed.invalid) {
-      ctx.ui.notify(`Invalid country code "${parsed.invalid}". Use a 2-letter ISO 3166-1 code or "off".`, "error");
+      ctx.ui.notify(
+        `Invalid country code "${parsed.invalid}". Use a 2-letter ISO 3166-1 code or "off".`,
+        "error",
+      );
       return;
     }
 
@@ -1182,7 +1534,10 @@ export default function (pi: ExtensionAPI) {
     }
 
     if (!(await applyCountryConfig(config))) {
-      ctx.ui.notify(`${what} ${setting}, but the running Tor did not accept it.`, "error");
+      ctx.ui.notify(
+        `${what} ${setting}, but the running Tor did not accept it.`,
+        "error",
+      );
       return;
     }
 
@@ -1203,7 +1558,8 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.registerCommand("tor-country", {
-    description: "Pin Tor exit nodes to a country (2-letter ISO code, e.g. us). Use 'off' to clear.",
+    description:
+      "Pin Tor exit nodes to a country (2-letter ISO code, e.g. us). Use 'off' to clear.",
     getArgumentCompletions: (prefix) => countryCompletions(prefix),
     handler: async (args, ctx) => {
       await setCountry(ctx, "exitNodes", "country", args);
@@ -1211,7 +1567,8 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.registerCommand("tor-exclude", {
-    description: "Never use Tor exit nodes in a country (2-letter ISO code, e.g. ru). Use 'off' to clear.",
+    description:
+      "Never use Tor exit nodes in a country (2-letter ISO code, e.g. ru). Use 'off' to clear.",
     getArgumentCompletions: (prefix) => countryCompletions(prefix),
     handler: async (args, ctx) => {
       await setCountry(ctx, "excludeExitNodes", "exclude", args);
@@ -1221,9 +1578,16 @@ export default function (pi: ExtensionAPI) {
   function setupTorMonitor(torBin: string) {
     if (state.torProcess) {
       state.torProcess.on("close", async (code) => {
-        if (state.enabled && !cycleInProgress && code !== 0 && restartAttempts < MAX_RESTART_ATTEMPTS) {
+        if (
+          state.enabled &&
+          !cycleInProgress &&
+          code !== 0 &&
+          restartAttempts < MAX_RESTART_ATTEMPTS
+        ) {
           restartAttempts++;
-          console.log(`Tor exited with code ${code}, restarting (attempt ${restartAttempts})...`);
+          console.log(
+            `Tor exited with code ${code}, restarting (attempt ${restartAttempts})...`,
+          );
           state.torProcess = null;
           await sleep(2000);
           if (!state.enabled || cycleInProgress) return;
@@ -1240,7 +1604,7 @@ export default function (pi: ExtensionAPI) {
     if (shouldEnable) {
       const startFailure = await ensureTorRunning();
       if (startFailure === null) {
-        if (!envIsSet()) setProxyEnv();
+        if (!envIsSet()) await setProxyEnv();
         startFailureReported = false;
         state.torPid = readTorPid();
         const ip = await getTorIp();
@@ -1252,7 +1616,7 @@ export default function (pi: ExtensionAPI) {
         ctx.ui.notify(startFailure, "error");
       }
     } else {
-      if (envIsSet()) clearProxyEnv();
+      if (envIsSet()) await clearProxyEnv();
     }
     writeLease();
     await maybeKillTor();
@@ -1272,7 +1636,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("session_shutdown", async () => {
-    if (envIsSet()) clearProxyEnv();
+    if (envIsSet()) await clearProxyEnv();
     writeLease();
     await maybeKillTor();
     ipPolling.stop();
