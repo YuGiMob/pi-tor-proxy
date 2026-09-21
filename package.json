@@ -39,7 +39,7 @@
     "smoke": "node scripts/smoke.mts"
   },
   "devDependencies": {
-    "@earendil-works/pi-coding-agent": "^0.74.0",
+    "@earendil-works/pi-coding-agent": "^0.87.0",
     "@types/node": "^22.0.0",
     "typescript": "^7.0.2"
   }

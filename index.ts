@@ -25,7 +25,6 @@ import { join, dirname } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { pipeline } from "node:stream/promises";
 import { Readable } from "node:stream";
-import { createRequire } from "node:module";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -164,7 +163,8 @@ export default function (pi: ExtensionAPI) {
     if (undiciModAttempted) return null;
     undiciModAttempted = true;
     try {
-      undiciModCache = await import("undici");
+      const specifier = "undici";
+      undiciModCache = await import(specifier);
     } catch {}
     return undiciModCache;
   }
@@ -593,11 +593,10 @@ export default function (pi: ExtensionAPI) {
     if (!dispatcherResolved) {
       dispatcherResolved = true;
       try {
-        const require = createRequire(import.meta.url);
-        const piPkg =
-          require.resolve("@earendil-works/pi-coding-agent/package.json");
-        const piDir = dirname(piPkg);
-        const dispatcherPath = join(piDir, "dist/core/http-dispatcher.js");
+        const piEntry = fileURLToPath(
+          import.meta.resolve("@earendil-works/pi-coding-agent"),
+        );
+        const dispatcherPath = join(dirname(piEntry), "core/http-dispatcher.js");
         const mod = (await import(pathToFileURL(dispatcherPath).href)) as {
           configureHttpDispatcher?: () => void;
         };
@@ -612,14 +611,14 @@ export default function (pi: ExtensionAPI) {
     }
     const undiciMod = (await getUndici()) as
       | {
-          EnvHttpProxyAgent?: new () => unknown;
+          EnvHttpProxyAgent?: new (opts?: { allowH2?: boolean; proxyTunnel?: boolean }) => unknown;
           setGlobalDispatcher?: (d: unknown) => void;
           install?: () => void;
         }
       | null;
     if (undiciMod?.EnvHttpProxyAgent && undiciMod?.setGlobalDispatcher) {
       try {
-        const dispatcher = new undiciMod.EnvHttpProxyAgent();
+        const dispatcher = new undiciMod.EnvHttpProxyAgent({ allowH2: false, proxyTunnel: true });
         undiciMod.setGlobalDispatcher(dispatcher);
         try {
           const maybeInstall = undiciMod.install;
